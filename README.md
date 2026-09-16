@@ -1,238 +1,380 @@
-# NetGate
+# NetGate — Contrôle d'accès Internet par application
 
-**Contrôle d'accès Internet par application, pour Windows.**
+[![Licence GPL-3.0-or-later](https://img.shields.io/badge/licence-GPL--3.0--or--later-blue.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB.svg)](https://www.python.org/downloads/)
+[![Windows](https://img.shields.io/badge/plateforme-Windows%2010%2F11-0078D6.svg)](#1-installation)
 
-Le robinet Internet est fermé ; tu l'ouvres programme par programme. NetGate compte ce que chacun consomme, te prévient quand l'enveloppe du jour s'épuise, et ne coupe jamais rien de lui-même.
+Le robinet Internet est fermé ; vous l'ouvrez programme par programme.
+NetGate compte ce que chacun consomme, vous prévient quand l'enveloppe du
+jour s'épuise, et ne coupe jamais rien de lui-même.
 
-Pensé pour les connexions comptées (partage de connexion mobile, forfait data limité, satellite, clé 4G) où chaque mégaoctet a de la valeur et où un Windows Update lancé au mauvais moment peut vider un forfait en une heure.
+**À qui ça sert.** À quiconque vit sur une connexion comptée — partage de
+connexion mobile, clé 4G, forfait data limité, liaison satellite — où chaque
+mégaoctet a de la valeur et où une mise à jour lancée au mauvais moment peut
+vider un forfait en une heure. NetGate pilote le pare-feu Windows pour
+bloquer tout le trafic sortant, vous demande quoi faire dès qu'un programme
+tente de sortir, attribue chaque octet envoyé ou reçu au programme qui l'a
+produit, et tient une enveloppe journalière avec alertes à 50, 80 et 100 %.
+Il produit une liste d'autorisations qui vous survit d'un lancement à
+l'autre, un compteur par programme et par jour, et un blason dans la zone
+de notification qui se remplit avec votre consommation. Version actuelle :
+1.3.
 
----
-
-## Sommaire
-
-- [Ce que fait NetGate](#ce-que-fait-netgate)
-- [Comment ça marche](#comment-ça-marche)
-- [Installation](#installation)
-  - [Option A : l'exécutable](#option-a--lexécutable)
-  - [Option B : depuis les sources](#option-b--depuis-les-sources)
-- [Premier démarrage](#premier-démarrage)
-- [Fonctionnalités](#fonctionnalités)
-- [Construire l'exécutable](#construire-lexécutable)
-- [Fichiers et données](#fichiers-et-données)
-- [Dépannage](#dépannage)
-- [Structure du code](#structure-du-code)
-- [Historique des versions](#historique-des-versions)
-- [Licence](#licence)
-
----
-
-## Ce que fait NetGate
-
-- **Bloque tout le trafic sortant par défaut**, puis autorise les programmes un par un.
-- **Te demande** dès qu'un programme inconnu essaie de sortir : une carte apparaît en bas à droite avec son nom lisible, son éditeur, à quoi il sert, et un conseil. Trois réponses : *Autoriser*, *Bloquer*, *Plus tard*.
-- **Mesure la consommation** de chaque programme (Mo envoyés / reçus) en temps réel.
-- **Surveille une enveloppe journalière** (ex. 400 Mo/jour) avec alertes à 50, 80 et 100 %, remise à zéro à l'heure de ton choix, heure locale ou UTC.
-- **Plages horaires** : un tableau de 48 demi-heures, hors plage plus rien ne sort.
-- **Vit dans la zone de notification** : le blason se remplit avec ta consommation (vert → orange → rouge).
-- **Bouton PANIQUE** : rétablit Internet immédiatement, en supprimant toutes les règles.
-- **Profils facultatifs** (Travail, Visio, Blackout, Essentiel…) pour basculer d'un usage à l'autre.
-- **Aide intégrée** (touche F1) qui explique tout ce qui précède, en français.
+Python 3.8+ avec tkinter, `psutil`, `pywintrace`, `pystray` et `pillow` —
+Windows 10 ou 11, droits administrateur.
 
 ---
 
-## Comment ça marche
+## 1. Installation
 
-NetGate ne réinvente pas de pare-feu : il pilote **le pare-feu Windows** existant via `netsh advfirewall`.
+### Python
 
-| Composant | Rôle |
-|---|---|
-| **Pare-feu** (`Firewall`) | Passe la politique sortante des trois profils réseau à *block*, puis crée une règle `allow` par programme autorisé. Toutes les règles portent le préfixe `NETGATE_` ; les règles tierces ne sont jamais touchées. Les modifications sont regroupées dans un script `netsh -f` pour ne pas figer l'interface. |
-| **Compteur ETW** (`EtwMeter`) | S'abonne au fournisseur `Microsoft-Windows-Kernel-Network` (Event Tracing for Windows) pour attribuer chaque octet envoyé/reçu à un PID. Si `pywintrace` est absent ou indisponible, repli sur un comptage global estimé via `psutil.net_io_counters()`. |
-| **Détecteur** (`ConnScanner`) | Toutes les 1,5 s, liste les connexions ouvertes (`psutil`) et signale les exécutables qui n'ont pas encore reçu de décision. |
-| **Inspecteur** (`Inspector`) | Répond à *« c'est quoi, ce programme ? »* : glossaire français des processus courants, version/éditeur lus dans les ressources du fichier, signature numérique, titre de fenêtre, et pour `svchost.exe` le service Windows exact hébergé par ce PID. |
-| **Interface** (`NetGateApp`, `AuthToast`, `Tray`) | Fenêtre principale Tkinter (thème sombre), carte de notification en bas à droite, icône de zone de notification avec menu contextuel. |
-| **État** (`State`) | Un seul fichier JSON : réglages, profils, autorisations, compteurs du jour, historique. |
+Il faut **Python 3.8 ou plus récent**, avec **tkinter**.
 
-**Règle DNS/DHCP « essentiels »** : quand la protection est active, une règle facultative laisse passer `svchost.exe` sur les ports 53 (DNS) et 67-68 (DHCP). Sans elle, même les programmes autorisés ne résolvent plus aucun nom.
+Installez Python depuis <https://www.python.org/downloads/> et **cochez
+deux cases** dans l'installateur :
 
-**Sortie propre** : *Quitter* depuis le menu de l'icône supprime toutes les règles `NETGATE_` et remet la politique sortante à *allow*. Si NetGate est tué brutalement, les règles restent dans Windows : relance NetGate (qui nettoie au démarrage) ou utilise PANIQUE.
+- `Add Python to PATH` (sur le premier écran)
+- `tcl/tk and IDLE` (sur l'écran « Optional Features »)
 
----
+Sans la seconde, l'application ne peut pas s'ouvrir : tkinter est ce qui
+dessine toute l'interface.
 
-## Installation
+Pour vérifier, ouvrez PowerShell et tapez :
 
-### Prérequis
-
-- **Windows 10 ou 11**. NetGate refuse de démarrer sur un autre système.
-- **Droits administrateur** : indispensables pour modifier le pare-feu. NetGate demande l'élévation UAC au lancement. Sans élévation, un *mode limité* reste possible : l'interface et les compteurs fonctionnent, le blocage non.
-
-### Option A : l'exécutable
-
-1. Télécharge `NetGate.exe` depuis la page **Releases** de ce dépôt.
-2. Place-le **dans son propre dossier** (il y créera `netgate.state.json` et `netgate.log`).
-3. Double-clique. Windows demande les droits administrateur : c'est normal.
-4. Au premier lancement, SmartScreen peut afficher un avertissement (programme non signé) : *Informations complémentaires* → *Exécuter quand même*.
-
-Aucune installation de Python n'est nécessaire.
-
-### Option B : depuis les sources
-
-```bash
-pip install psutil pywintrace pystray pillow
+```powershell
+python --version
+python -m tkinter
 ```
 
-Puis, dans un terminal **administrateur** :
+La première commande doit afficher un numéro de version, la seconde doit
+ouvrir une petite fenêtre de test.
 
-```bash
+### Les bibliothèques
+
+```powershell
+python -m pip install psutil pywintrace pystray pillow
+```
+
+Chacune est facultative au sens strict : NetGate démarre même si l'une
+manque, avec des fonctions en moins. Le tableau dit lesquelles, pour que
+vous puissiez décider en connaissance de cause.
+
+| Bibliothèque | Ce qu'elle apporte | Sans elle |
+|---|---|---|
+| `psutil` | découverte des connexions ouvertes, comptage de repli | aucun programme n'est détecté, aucune notification n'apparaît |
+| `pywintrace` | comptage par programme (Event Tracing for Windows) | le compteur affiche un total « global estimé », sans détail par programme |
+| `pystray` + `pillow` | l'icône dans la zone de notification et son menu | la fenêtre principale reste seule, sans blason près de l'horloge |
+
+### Les droits administrateur
+
+Modifier le pare-feu Windows exige l'élévation : NetGate la demande lui-même
+au lancement (invite UAC). Si vous la refusez, il propose un **mode
+limité** où l'interface et les compteurs fonctionnent, mais où rien n'est
+bloqué. C'est un bon mode pour observer avant de décider.
+
+---
+
+## 2. Les fichiers
+
+Récupérez le dépôt, au choix :
+
+- bouton vert **Code → Download ZIP** sur la page GitHub, puis décompressez
+  l'archive dans un dossier (par exemple `C:\NetGate`) ;
+- ou, si vous avez git :
+
+```powershell
+git clone https://github.com/theptitprince/NetGate.git C:\NetGate
+```
+
+Le programme tient en **un seul fichier**, `netgate.py`, organisé en
+sections :
+
+| Section | Rôle |
+|---|---|
+| `Firewall` | génère et exécute les scripts `netsh advfirewall` |
+| `EtwMeter` | écoute le fournisseur Kernel-Network et attribue les octets à chaque processus |
+| `ConnScanner` | découvre les connexions ouvertes et signale les programmes sans décision |
+| `State` | charge et sauvegarde le fichier d'état, gère les périodes et les profils |
+| `Inspector` | répond à « qui est ce programme ? » |
+| `AuthToast` | la carte Autoriser / Bloquer / Plus tard |
+| `Tray` | l'icône de la zone de notification et son menu |
+| `NetGateApp` | la fenêtre principale, les réglages, la liste, les plages horaires |
+
+Le fichier `LICENSE` contient le texte de la licence du programme (voir
+« Licence » en fin de document).
+
+Placez `netgate.py` **dans son propre dossier** : il y crée ses fichiers de
+travail (voir « Ce que le programme crée à côté de lui »).
+
+---
+
+## 3. Lancement
+
+Ouvrez PowerShell dans le dossier du programme et tapez :
+
+```powershell
 python netgate.py
 ```
 
-Toutes les dépendances sont optionnelles au sens strict : NetGate démarre même si l'une manque, avec des fonctions dégradées.
+Windows demande les droits administrateur : acceptez. La fenêtre principale
+s'ouvre, et un blason apparaît dans la zone de notification, à côté de
+l'horloge.
 
-| Dépendance | Sans elle |
-|---|---|
-| `psutil` | Pas de détection des connexions, pas de comptage de repli. |
-| `pywintrace` | Comptage par processus impossible ; affichage « global estimé ». |
-| `pystray` + `pillow` | Pas d'icône dans la zone de notification. |
+Un raccourci sur le bureau est pratique : cible
+`python C:\NetGate\netgate.py`, dossier de démarrage `C:\NetGate`. Pour
+lancer NetGate sans fenêtre de console, remplacez `python` par `pythonw`.
 
-`tkinter` est fourni avec Python pour Windows.
+**Fermer la fenêtre ne quitte pas** : NetGate continue de surveiller et le
+blocage reste actif. Pour arrêter le programme, passez par le menu de
+l'icône (*Quitter*). À ce moment, toutes les règles créées sont supprimées
+et le pare-feu retrouve sa politique sortante d'origine. Ce détour est
+volontaire : une fermeture par mégarde ne doit jamais couper la surveillance
+en laissant croire qu'elle tourne.
 
 ---
 
-## Premier démarrage
+## 4. Prise en main
 
-1. **Réglages** : enveloppe du jour (Mo), heure de remise à zéro, case DNS/DHCP (à laisser cochée).
+Le premier réflexe utile est d'**observer avant de bloquer**. Laissez
+NetGate tourner une heure ou deux **protection inactive** : il découvre les
+programmes qui sortent, compte ce qu'ils consomment et retient vos réponses,
+sans rien couper. Vous voyez ainsi qui consomme quoi sans risquer de casser
+une session de travail.
+
+Ensuite :
+
+1. **Réglages** : enveloppe du jour (en Mo), heure de remise à zéro, et la
+   case *DNS/DHCP essentiels*, à laisser cochée.
 2. **Activer la protection.**
-3. Ouvre ton navigateur : une notification apparaît, clique *Autoriser*.
-4. Répète pour chaque programme dont tu as besoin. Au bout de dix minutes, tu n'es plus dérangé.
+3. Ouvrez votre navigateur : une carte apparaît en bas à droite, cliquez
+   *Autoriser*.
+4. Répétez pour chaque programme dont vous avez besoin. Au bout de dix
+   minutes, les demandes s'espacent : la liste est constituée.
 
-> Conseil : laisse d'abord NetGate tourner **protection inactive** pendant une heure ou deux. Il observe, compte et retient tes réponses sans rien bloquer, ce qui permet de découvrir qui consomme quoi sans rien casser.
+Chaque carte de demande affiche le nom lisible du programme, son éditeur, à
+quoi il sert et un conseil, pour que vous n'ayez pas à deviner ce que cache
+`svchost.exe` ou `msedgewebview2.exe`. Trois réponses : *Autoriser*,
+*Bloquer*, *Plus tard*. La dernière laisse la question ouverte sans rien
+changer.
 
 ---
 
-## Fonctionnalités
+## 5. Comment ça marche
 
-### La liste des applications
+NetGate n'est pas un pare-feu : il pilote **le pare-feu Windows** existant
+via `netsh advfirewall`. C'est ce qui le rend léger et prévisible : ce que
+vous voyez dans *Pare-feu Windows Defender avec fonctions avancées de
+sécurité* → *Règles de trafic sortant* est exactement ce qui s'applique.
 
-Vert = autorisé, rouge = bloqué, orange = en attente. Tri par colonne (accès, volume), double-clic pour changer d'avis, fiche descriptive en bas de fenêtre. *Ajouter un programme* autorise quelque chose à l'avance, sans attendre qu'il se manifeste.
+**Le blocage.** Quand la protection est active, la politique sortante des
+trois profils réseau (domaine, privé, public) passe à *bloquer*, puis une
+règle *autoriser* est créée par programme accepté. Toutes les règles de
+NetGate portent le préfixe `NETGATE_` ; les règles tierces ne sont jamais
+touchées. Les modifications sont regroupées dans un script `netsh -f`
+exécuté en une fois, parce que chaque appel `netsh` isolé coûte environ
+200 ms et figerait l'interface.
 
-### L'enveloppe
+**La règle DNS/DHCP « essentiels ».** Une règle facultative, cochée par
+défaut, laisse passer `svchost.exe` sur les ports 53 (DNS) et 67-68 (DHCP).
+Sans elle, même les programmes autorisés ne résolvent plus aucun nom et
+tout semble bloqué. Si tout se met à échouer, c'est le premier réglage à
+vérifier.
 
-- Décomptée **uniquement quand la protection est active** ; hors protection, le trafic est mesuré mais affiché à part.
-- Remise à zéro à l'heure choisie (à la minute près, heure locale ou UTC), **même si le PC était éteint** à ce moment-là.
-- Alertes à 50, 80 et 100 % : NetGate prévient, mais ne coupe jamais.
-- Bouton *Remettre le compteur à zéro* dans les réglages, sans toucher aux autorisations.
+**Le comptage.** NetGate s'abonne au fournisseur
+`Microsoft-Windows-Kernel-Network` (Event Tracing for Windows) pour
+attribuer chaque octet envoyé ou reçu au processus qui l'a produit. Si
+`pywintrace` manque ou si la session ETW ne peut pas démarrer, il se replie
+sur un total global mesuré par `psutil.net_io_counters()`, signalé comme
+« global estimé » pour que vous sachiez que le détail par programme n'est
+pas disponible.
+
+**La découverte.** Toutes les 1,5 s, la liste des connexions ouvertes est
+relevée et chaque exécutable qui n'a pas encore reçu de décision déclenche
+une carte de demande.
+
+**L'inspecteur.** Pour répondre à « qui est ce programme ? », NetGate
+combine un glossaire en français des processus courants, la version et
+l'éditeur lus dans les ressources du fichier, la signature numérique, le
+titre de fenêtre, et pour `svchost.exe` le service Windows exact hébergé par
+ce processus.
+
+**La remise en état.** Au démarrage, NetGate supprime les règles `NETGATE_`
+restées d'une session interrompue (coupure de courant, processus tué), pour
+que rien ne reste bloqué à votre insu. Le bouton **PANIQUE** fait la même
+chose à la demande, immédiatement : toutes les règles disparaissent et
+Internet revient.
+
+---
+
+## 6. Ce que le programme crée à côté de lui
+
+Tout est rangé **à côté de `netgate.py`**. Si ce dossier n'est pas
+inscriptible (Program Files, clé USB protégée, dossier réseau), NetGate se
+replie automatiquement sur `%APPDATA%\NetGate`.
+
+| Fichier | Contenu |
+|---|---|
+| `netgate.state.json` | réglages, profils, autorisations, compteurs du jour, historique, catalogue des programmes vus. **Copiez-le pour sauvegarder votre configuration.** Renommez-le pour repartir de zéro. |
+| `netgate.log` | trace de démarrage et erreurs éventuelles : le premier fichier à ouvrir quand quelque chose ne va pas. |
+| `netgate.ico` | le blason, régénéré à chaque changement de profil ou de palier de consommation, pour la fenêtre et l'exécutable. |
+
+`netgate.state.json` contient les chemins de vos programmes : c'est un
+fichier personnel, ne le partagez pas tel quel.
+
+---
+
+## 7. L'enveloppe, les plages horaires, les profils
+
+### La liste des programmes
+
+Vert = autorisé, rouge = bloqué, orange = en attente. Les colonnes se trient
+(accès, volume), un double-clic change la décision, et la fiche descriptive
+en bas de fenêtre rappelle qui est le programme sélectionné. *Ajouter un
+programme* autorise quelque chose à l'avance, sans attendre qu'il se
+manifeste — utile pour un logiciel de visioconférence juste avant une
+réunion.
+
+### L'enveloppe du jour
+
+- L'enveloppe n'est **décomptée que lorsque la protection est active**.
+  Hors protection, le trafic est mesuré et affiché à part : observer ne
+  coûte rien sur le quota.
+- La remise à zéro se fait à l'heure choisie, à la minute près, en heure
+  locale ou UTC. Si l'ordinateur est éteint à ce moment-là, la bascule se
+  fait au démarrage suivant ; si l'horloge du système a reculé, la bascule
+  est forcée pour ne pas prolonger indûment la journée.
+- Alertes à 50, 80 et 100 % : NetGate prévient, il ne coupe jamais. Couper
+  serait décider à votre place ; la décision reste la vôtre.
+- *Remettre le compteur à zéro*, dans les réglages, repart de zéro sans
+  toucher aux autorisations.
 
 ### Les plages horaires
 
-Réglages → *Plages horaires* : 48 demi-heures à cocher. Hors plage, plus rien ne sort, même les programmes autorisés. Raccourcis *tout ouvrir*, *tout fermer*, *08h-22h*. Le bandeau indique la prochaine ouverture ou fermeture.
+Réglages → *Plages horaires* : un tableau de 48 demi-heures à cocher. Hors
+plage, plus rien ne sort, même les programmes autorisés. Raccourcis *tout
+ouvrir*, *tout fermer*, *08h-22h*. Le bandeau indique la prochaine ouverture
+ou fermeture, pour que vous ne cherchiez pas pourquoi tout s'est arrêté à
+22 h.
 
 ### L'icône près de l'horloge
 
-- La croix de la fenêtre **ne quitte pas** : NetGate continue de surveiller et le blocage reste actif.
-- Clic droit : *Ouvrir*, choix du profil, Mo restants, *Tout débloquer (PANIQUE)*, *Quitter*.
-- Le blason se remplit avec la consommation.
+Le blason se remplit avec la consommation (vert → orange → rouge). Clic
+droit : *Ouvrir*, choix du profil, Mo restants, *Tout débloquer (PANIQUE)*,
+*Quitter*.
 
 ### Les profils
 
-Par défaut, une seule liste d'autorisations. Si tu crées des profils dans les réglages, une barre de choix apparaît en haut de la fenêtre. Modèles proposés : *Blackout*, *Essentiel*, *Travail*, *Visio*, chacun avec sa couleur et son budget indicatif.
+Par défaut, une seule liste d'autorisations, et aucune barre de profils
+n'encombre la fenêtre. Si vous créez des profils dans les réglages, une
+barre de choix apparaît en haut. Modèles proposés : *Blackout*, *Essentiel*,
+*Travail*, *Visio*, chacun avec sa couleur et son budget indicatif. Un
+profil est une liste d'autorisations complète : basculer de *Travail* à
+*Visio* remplace l'une par l'autre.
 
 ### Effacer et recommencer
 
-Les réglages permettent de réinitialiser la liste active, les compteurs, l'historique, les autorisations, ou tout remettre à neuf. Les règles du pare-feu sont nettoyées avant, pour qu'aucun programme ne reste bloqué sans moyen de le débloquer.
+Les réglages permettent de réinitialiser la liste active, les compteurs,
+l'historique, les autorisations, ou de tout remettre à neuf. Les règles du
+pare-feu sont nettoyées avant chaque réinitialisation, pour qu'aucun
+programme ne reste bloqué sans moyen de le débloquer.
+
+### L'aide intégrée
+
+La touche **F1** ouvre une aide en français qui reprend tout ce qui précède,
+directement dans le programme.
 
 ---
 
-## Construire l'exécutable
+## 8. Construire un exécutable
 
-Depuis le dossier des sources, avec Python installé :
+Un exécutable autonome évite d'installer Python sur la machine cible et
+demande lui-même l'élévation UAC. Depuis le dossier des sources :
 
-```bash
-pip install --upgrade pyinstaller psutil pywintrace pystray pillow
+```powershell
+python -m pip install --upgrade pyinstaller psutil pywintrace pystray pillow
 ```
 
-```bash
+```powershell
+python -c "import netgate; netgate.write_ico(netgate.C_ACCENT, 0.35)"
+```
+
+```powershell
 python -m PyInstaller --onefile --noconsole --uac-admin --clean --noconfirm --name NetGate --icon netgate.ico --collect-all etw --collect-all pystray --hidden-import pystray._win32 --hidden-import PIL._tkinter_finder netgate.py
 ```
 
 - `--onefile --noconsole` : un seul fichier, sans fenêtre de console.
-- `--uac-admin` : l'exécutable demande lui-même l'élévation UAC au lancement.
-- `--icon netgate.ico` : le blason fourni dans ce dépôt (régénérable avec `python -c "import netgate; netgate.write_ico(netgate.C_ACCENT, 0.35)"`).
-- `--collect-all` / `--hidden-import` : modules chargés dynamiquement que PyInstaller ne détecte pas seul.
+- `--uac-admin` : l'exécutable demande l'élévation au lancement.
+- `--icon netgate.ico` : le blason, généré par la deuxième commande.
+- `--collect-all` / `--hidden-import` : modules chargés dynamiquement que
+  PyInstaller ne détecte pas seul.
 
-Compte 2 à 5 minutes. Résultat : `dist\NetGate.exe`, autonome, d'environ 30 Mo, qui demande lui-même l'élévation UAC. Les dossiers `build/`, `dist/` et le fichier `NetGate.spec` peuvent ensuite être supprimés.
+Comptez 2 à 5 minutes. Résultat : `dist\NetGate.exe`, autonome, d'environ
+30 Mo, à placer dans son propre dossier comme `netgate.py`. Les dossiers
+`build/`, `dist/` et le fichier `NetGate.spec` peuvent ensuite être
+supprimés. Au premier lancement, SmartScreen peut afficher un avertissement
+(programme non signé) : *Informations complémentaires* → *Exécuter quand
+même*.
 
-> Un antivirus trop zélé peut bloquer PyInstaller : c'est la cause la plus fréquente d'échec.
-
----
-
-## Fichiers et données
-
-Tout est rangé **à côté de `netgate.py`** (ou de `NetGate.exe`). Si ce dossier n'est pas inscriptible (Program Files, clé USB protégée, dossier réseau), repli automatique sur `%APPDATA%\NetGate`.
-
-| Fichier | Contenu |
-|---|---|
-| `netgate.state.json` | Réglages, profils, autorisations, compteurs du jour, historique, catalogue des programmes vus. **Copie-le pour sauvegarder ta configuration.** Renomme-le pour repartir de zéro. |
-| `netgate.log` | Trace de démarrage et erreurs éventuelles. |
-| `netgate.ico` | Icône générée pour l'exécutable et la fenêtre. |
-
-Dans le pare-feu Windows, toutes les règles créées portent le préfixe `NETGATE_` et sont visibles dans *Pare-feu Windows Defender avec fonctions avancées de sécurité* → *Règles de trafic sortant*.
-
-> `netgate.state.json` contient les chemins de tes programmes et donc ton nom d'utilisateur : **il n'est pas versionné** dans ce dépôt (voir `.gitignore`).
+Un antivirus trop zélé peut bloquer PyInstaller : c'est la cause la plus
+fréquente d'échec.
 
 ---
 
-## Dépannage
+## 9. En cas de souci
 
-| Symptôme | Cause probable / remède |
-|---|---|
-| Plus rien ne se connecte, même les programmes autorisés | La case **DNS/DHCP** n'est pas cochée dans les réglages. |
-| NetGate ne démarre pas | Lance-le depuis un *Terminal (administrateur)* pour voir l'erreur, ou consulte `netgate.log`. |
-| Le comptage indique « global estimé » | `pywintrace` n'est pas installé ou la session ETW n'a pas pu démarrer. |
-| Internet est resté bloqué après un plantage | Relance NetGate (il nettoie au démarrage), ou clique **PANIQUE**. En dernier recours : `netsh advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound` en administrateur. |
-| Configuration corrompue | Renomme `netgate.state.json` et relance. |
+**« No module named tkinter »** — Python a été installé sans tcl/tk.
+Relancez l'installateur, choisissez *Modify*, et cochez `tcl/tk and IDLE`.
 
----
+**« No module named psutil »** (ou `etw`, `pystray`, `PIL`) — la commande
+d'installation n'a pas été exécutée, ou l'a été pour un autre Python.
+Réessayez avec `python -m pip install psutil pywintrace pystray pillow` (la
+forme `python -m pip` garantit qu'on installe bien pour le Python qui
+lancera le programme).
 
-## Structure du code
+**Plus rien ne se connecte, même les programmes autorisés** — la case
+**DNS/DHCP essentiels** n'est pas cochée dans les réglages. Sans résolution
+de noms, aucun programme ne sait où aller.
 
-Un seul fichier, [`netgate.py`](netgate.py), organisé en sections :
+**NetGate ne démarre pas** — lancez-le depuis un *Terminal (administrateur)*
+pour voir l'erreur, ou ouvrez `netgate.log` à côté de `netgate.py` (ou dans
+`%APPDATA%\NetGate`).
 
-```
-CONSTANTES           identité, version, couleurs, GUID ETW, chemins
-UTILITAIRES          is_admin, relaunch_as_admin, run_netsh, fmt_bytes…
-PARE-FEU WINDOWS     class Firewall        — génération et exécution des scripts netsh
-COMPTEUR ETW         class EtwMeter        — thread d'écoute Kernel-Network + repli psutil
-DETECTION            class ConnScanner     — thread de découverte des connexions
-ETAT                 class State           — chargement/sauvegarde JSON, périodes, profils
-INSPECTEUR           GLOSSARY, class Inspector — qui est ce programme ?
-NOTIFICATION         class AuthToast       — carte Autoriser / Bloquer / Plus tard
-ICONE                build_icon_image, write_ico — blason dynamique
-ZONE DE NOTIFICATION class Tray            — pystray et son menu
-AIDE INTEGREE        HELP                  — contenu de la fenêtre F1
-FENETRE PRINCIPALE   class NetGateApp      — Tkinter, réglages, liste, plages horaires
-DEMARRAGE            main()                — élévation UAC, mode limité, capture d'erreurs
+**Le compteur indique « global estimé »** — `pywintrace` n'est pas installé
+ou la session ETW n'a pas pu démarrer. Le total reste juste, le détail par
+programme n'est pas disponible.
+
+**Internet est resté bloqué après un plantage** — relancez NetGate (il
+nettoie ses règles au démarrage), ou cliquez **PANIQUE**. En dernier
+recours, dans un PowerShell administrateur :
+
+```powershell
+netsh advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound
 ```
 
-Conventions : tout est en français, sans accents dans les identifiants et les commentaires ; les couleurs sont des constantes `C_*` ; chaque appel `netsh` coûte ~200 ms, d'où le regroupement systématique en scripts.
+**Configuration corrompue** — renommez `netgate.state.json` et relancez.
+NetGate repart avec des réglages neufs.
 
 ---
 
-## Historique des versions
+## 10. Licence
 
-| Version | Changements |
-|---|---|
-| **1.3** | Plages horaires : tableau de 48 demi-heures dans les réglages, hors plage plus aucun programme ne sort. |
-| 1.2 | L'enveloppe n'est décomptée que lorsque la protection est active ; hors protection le trafic est mesuré mais affiché à part. Trace de la remise à zéro au démarrage. Bascule forcée si l'horloge a reculé. |
-| 1.1 | Numéro de version affiché dans le titre, la barre d'état et l'aide. Remise à zéro du compteur déplacée dans les réglages. |
-| 1.0 | Version initiale : filtrage par application via le pare-feu Windows, comptage ETW par processus, enveloppe journalière avec alertes, notifications d'autorisation, icône dans la zone de notification, profils facultatifs, aide intégrée (F1). |
+NetGate est un **logiciel libre**, distribué sous la licence
+**GNU General Public License, version 3 ou ultérieure** (GPL-3.0-or-later).
 
-Numérotation : `V<majeure>.<mineure>`, plus une lettre pour une retouche cosmétique (`V1.1a`).
+Copyright © 2026 ETDEL.
+
+Concrètement, vous pouvez utiliser le programme librement, y compris dans un
+cadre professionnel, l'étudier, le modifier et le redistribuer — à condition
+que toute version redistribuée, modifiée ou non, reste sous la même licence,
+avec son code source et la mention de copyright. Le programme est fourni
+**sans aucune garantie** : il vous aide à maîtriser votre consommation, il
+ne remplace ni votre vigilance ni les protections de votre système.
+
+Le texte intégral de la licence est dans le fichier `LICENSE` du dépôt et
+sur <https://www.gnu.org/licenses/gpl-3.0.html>. Le fichier source
+`netgate.py` porte l'en-tête de licence correspondant.
 
 ---
 
-## Licence
-
-[GNU GPL v3](LICENSE) — ETDEL © 2026.
-
-NetGate est un logiciel libre : tu peux le redistribuer et le modifier selon les termes de la GNU General Public License version 3, telle que publiée par la Free Software Foundation. Il est distribué sans aucune garantie ; voir le fichier [LICENSE](LICENSE) pour le texte complet.
+*NetGate — ETDEL 2026 — GPL-3.0-or-later*
