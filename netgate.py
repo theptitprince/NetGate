@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# NetGate -- controle d'acces Internet par application (Windows)
+# Copyright (C) 2026 ETDEL
+#
+# Ce programme est un logiciel libre : vous pouvez le redistribuer et/ou le
+# modifier selon les termes de la GNU General Public License telle que
+# publiee par la Free Software Foundation, soit la version 3 de la licence,
+# soit (a votre choix) toute version ulterieure.
+#
+# Ce programme est distribue dans l'espoir qu'il sera utile, mais SANS
+# AUCUNE GARANTIE, sans meme la garantie implicite de QUALITE MARCHANDE ou
+# d'ADEQUATION A UN USAGE PARTICULIER. Voir la GNU General Public License
+# pour plus de details.
+#
+# Vous devriez avoir recu une copie de la GNU General Public License avec ce
+# programme (fichier LICENSE). Sinon, voir <https://www.gnu.org/licenses/>.
 """
 NetGate - Controle d'acces Internet par application (Windows)
 =============================================================
