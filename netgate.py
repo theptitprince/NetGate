@@ -4969,6 +4969,8 @@ def selftest_wfp():
         note("", "")
         if bilan["ok"]:
             note("RESULTAT", "le moteur NetGate (WFP) fonctionne sur ce PC")
+        elif bilan.get("deja_lance"):
+            note("RESULTAT", "autotest incomplet : quitte NetGate, puis relance-le")
         else:
             note("RESULTAT", "moteur NetGate NON utilisable ici : Reglages > Moteur "
                              "de filtrage > Pare-feu Windows")
@@ -5011,7 +5013,19 @@ def selftest_wfp():
         eng.open()
         note("OK", "session dynamique ouverte, sous-couche NetGate creee")
     except Exception as e:
-        exige(False, "ouverture du moteur : %s" % e)
+        if isinstance(e, WfpError) and e.code == FWP_E_ALREADY_EXISTS:
+            # la sous-couche n'existe que tant qu'un NetGate tourne
+            bilan["deja_lance"] = True
+            exige(False, "NetGate est deja lance : quitte-le par son icone pres de "
+                         "l'horloge > Quitter (fermer la fenetre ne suffit pas), puis "
+                         "relance l'autotest")
+        else:
+            exige(False, "ouverture du moteur : %s" % e)
+        # le comptage par programme ne depend pas du moteur : on le controle quand meme
+        try:
+            controle_comptage(note)
+        except Exception as e2:
+            note("ATTENTION", "controle du comptage interrompu : %s" % e2)
         return fin()
     moi = eng.app_id(sys.executable)
     if not exige(moi is not None, "identifiant WFP de ce programme"):
