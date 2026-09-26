@@ -148,12 +148,14 @@ ETW_RECV_IDS = {11, 27, 43, 59}
 # au lancement suivant au lieu de s'accumuler.
 ETW_SESSION = "NetGate-Reseau"
 # Microsoft-Windows-TCPIP, evenement 1020 : "connect failed: inspection
-# status", une connexion refusee par le moteur de filtrage. Niveau Erreur et
-# mot-cle ConnectPath : seuls les echecs de connexion remontent, pas le flot
-# des evenements TCP.
+# status", une connexion refusee par le moteur de filtrage. Le manifeste en
+# decrit deux versions, niveau Erreur (v1) et Information (v0) : on ecoute
+# jusqu'au niveau Information, mot-cle ConnectPath seulement ; les autres
+# evenements de connexion arrivent mais ne sont meme pas decodes.
 TCPIP_GUID = "{2F07E2EE-15DB-40F1-90EF-9D7BA282188A}"
 TCPIP_CONNECT_BLOCKED = 1020
 TCPIP_KW_CONNECTPATH = 0x400000000
+TCPIP_LEVEL = 4
 
 # Adresses publiques, c'est-a-dire tout sauf localhost, reseaux prives,
 # liaison locale et multidiffusion. Les regles de blocage ne visent qu'elles :
@@ -1229,8 +1231,12 @@ class EtwMeter(threading.Thread):
     def _bloque(self, payload):
         """Connexion refusee par le moteur de filtrage : le signal d'une
         demande, meme pour un programme qui n'a jamais reussi a sortir."""
-        pid = self._pick(payload, ("ProcessId", "PID"))
+        pid = self._pick(payload, ("ProcessId", "PID", "Pid"))
         if not pid:
+            # champs non decodes : l'en-tete porte le processus qui a emis
+            # l'evenement, celui qui a tente la connexion
+            pid = self._pick(payload.get("EventHeader") or {}, ("ProcessId",))
+        if not pid or pid == 4:
             return
         ip = sockaddr_ip(payload.get("RemoteAddress"))
         if ip and self._scope(ip)[0] != "internet":
@@ -1293,7 +1299,7 @@ class EtwMeter(threading.Thread):
         essais = [[compteur]]
         try:
             essais.insert(0, [compteur, _etw.ProviderInfo(
-                "Microsoft-Windows-TCPIP", _GUID(TCPIP_GUID), level=2,
+                "Microsoft-Windows-TCPIP", _GUID(TCPIP_GUID), level=TCPIP_LEVEL,
                 any_keywords=TCPIP_KW_CONNECTPATH)])
         except Exception:
             pass
@@ -4967,17 +4973,45 @@ def selftest_wfp():
     r = essai_connexion(TEST_ADRESSE)
     exige(r != "refuse", "sans filtre, la connexion de test n'est pas refusee (%s)" % r)
 
-    session, vus = None, []
+    moi_pid = os.getpid()
+    capture = []            # evenements de connexion emis pour ce programme-ci
+
+    def rappel(ev):
+        try:
+            charge = ev[1]
+            entete = charge.get("EventHeader") or {}
+            pid_e = EtwMeter._pick(entete, ("ProcessId",))
+            pid_c = EtwMeter._pick(charge, ("ProcessId", "PID", "Pid"))
+            if moi_pid in (pid_e, pid_c):
+                d = entete.get("EventDescriptor") or {}
+                capture.append((str(entete.get("ProviderId", "")).upper(), ev[0],
+                                d.get("Version"), d.get("Level"), pid_e, pid_c,
+                                charge.get("Status") or charge.get("FailureCode")))
+        except Exception:
+            pass
+
+    def vu_1020():
+        return any("2F07E2EE" in c[0] and c[1] == TCPIP_CONNECT_BLOCKED
+                   for c in list(capture))
+
+    session = None
     if _etw is not None:
         try:
             EtwMeter._arreter_session("NetGate-Test")
+            # filet large : tout le chemin de connexion de TCPIP et les
+            # echecs de Kernel-Network, pour voir ce que Windows emet vraiment
+            # quand une connexion est refusee
             session = _etw.ETW(
-                session_name="NetGate-Test", event_id_filters=[TCPIP_CONNECT_BLOCKED],
-                providers=[_etw.ProviderInfo("Microsoft-Windows-TCPIP", _GUID(TCPIP_GUID),
-                                             level=2, any_keywords=TCPIP_KW_CONNECTPATH)],
-                event_callback=lambda ev: vus.append(ev))
+                session_name="NetGate-Test",
+                event_id_filters=sorted({12, 17, 28, 49} | set(range(1000, 1100))),
+                providers=[
+                    _etw.ProviderInfo("Microsoft-Windows-TCPIP", _GUID(TCPIP_GUID), level=5,
+                                      any_keywords=TCPIP_KW_CONNECTPATH | 0x480),
+                    _etw.ProviderInfo("Microsoft-Windows-Kernel-Network",
+                                      _GUID(KERNEL_NETWORK_GUID), level=5)],
+                event_callback=rappel)
             session.start()
-            time.sleep(1.0)
+            time.sleep(1.5)
         except Exception as e:
             note("ATTENTION", "session ETW de test impossible : %s" % e)
             session = None
@@ -4993,21 +5027,31 @@ def selftest_wfp():
 
         if session is not None:
             fin_attente = time.time() + 5
-            moi_pid = os.getpid()
-            while time.time() < fin_attente and not any(
-                    EtwMeter._pick(ev[1], ("ProcessId", "PID")) == moi_pid
-                    for ev in list(vus) if isinstance(ev[1], dict)):
+            while time.time() < fin_attente and not vu_1020():
                 time.sleep(0.2)
-            vu = any(EtwMeter._pick(ev[1], ("ProcessId", "PID")) == moi_pid
-                     for ev in list(vus) if isinstance(ev[1], dict))
-            note("OK" if vu else "ATTENTION",
-                 "la tentative bloquee est visible (evenement TCPIP 1020)" if vu else
-                 "tentative bloquee invisible : pas de carte de demande pour un "
-                 "programme bloque, le reste fonctionne")
+            time.sleep(1.0)             # laisser arriver les evenements voisins
             try:
                 session.stop()
             except Exception:
                 pass
+            trouve = vu_1020()
+            note("OK" if trouve else "ATTENTION",
+                 "la tentative bloquee est visible (evenement TCPIP 1020)" if trouve else
+                 "tentative bloquee invisible : pas de carte de demande pour un "
+                 "programme bloque, le reste fonctionne")
+            # ce que Windows a emis pour cette connexion : de quoi regler la
+            # detection si l'evenement attendu n'est pas celui qui arrive
+            vus = {}
+            for prov, i, v, niv, pe, pc, st in list(capture):
+                nom = ("TCPIP" if "2F07E2EE" in prov else
+                       "Kernel-Network" if "7DD42A49" in prov else prov)
+                vus.setdefault((nom, i, v, niv), (pe, pc, st))
+            for (nom, i, v, niv), (pe, pc, st) in sorted(
+                    vus.items(), key=lambda kv: (kv[0][0], kv[0][1]))[:15]:
+                note("", "vu : %s %s v%s niveau %s - pid en-tete %s, pid champ %s%s"
+                     % (nom, i, v, niv, pe, pc, (", statut %s" % st) if st else ""))
+            if not vus:
+                note("", "aucun evenement de connexion recu pour ce programme")
 
         f_ok = eng.add_filter("C4", 10, FWP_ACTION_PERMIT, [cond_moi, vers(TEST_ADRESSE[0])],
                               "NetGate test - autorisation")
