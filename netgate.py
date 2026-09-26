@@ -148,10 +148,11 @@ ETW_RECV_IDS = {11, 27, 43, 59}
 # au lancement suivant au lieu de s'accumuler.
 ETW_SESSION = "NetGate-Reseau"
 # Microsoft-Windows-TCPIP, evenement 1020 : "connect failed: inspection
-# status", une connexion refusee par le moteur de filtrage. Le manifeste en
-# decrit deux versions, niveau Erreur (v1) et Information (v0) : on ecoute
-# jusqu'au niveau Information, mot-cle ConnectPath seulement ; les autres
-# evenements de connexion arrivent mais ne sont meme pas decodes.
+# status", une connexion refusee par le moteur de filtrage. Windows 11 emet
+# la version 1, niveau Erreur ; le manifeste decrit aussi une version 0 au
+# niveau Information, qu'un Windows plus ancien pourrait emettre : on ecoute
+# jusqu'a ce niveau, mot-cle ConnectPath seulement. Les autres evenements
+# de connexion arrivent mais ne sont meme pas decodes.
 TCPIP_GUID = "{2F07E2EE-15DB-40F1-90EF-9D7BA282188A}"
 TCPIP_CONNECT_BLOCKED = 1020
 TCPIP_KW_CONNECTPATH = 0x400000000
@@ -1233,8 +1234,9 @@ class EtwMeter(threading.Thread):
         demande, meme pour un programme qui n'a jamais reussi a sortir."""
         pid = self._pick(payload, ("ProcessId", "PID", "Pid"))
         if not pid:
-            # champs non decodes : l'en-tete porte le processus qui a emis
-            # l'evenement, celui qui a tente la connexion
+            # Windows 11 (build 26200) met 0 dans le champ ProcessId de cet
+            # evenement ; l'en-tete porte le processus qui l'a emis, celui qui
+            # a tente la connexion (constate par l'autotest)
             pid = self._pick(payload.get("EventHeader") or {}, ("ProcessId",))
         if not pid or pid == 4:
             return
@@ -4975,6 +4977,7 @@ def selftest_wfp():
 
     moi_pid = os.getpid()
     capture = []            # evenements de connexion emis pour ce programme-ci
+    refus = []              # evenements 1020 bruts, tels que NetGate les recevra
 
     def rappel(ev):
         try:
@@ -4984,9 +4987,12 @@ def selftest_wfp():
             pid_c = EtwMeter._pick(charge, ("ProcessId", "PID", "Pid"))
             if moi_pid in (pid_e, pid_c):
                 d = entete.get("EventDescriptor") or {}
-                capture.append((str(entete.get("ProviderId", "")).upper(), ev[0],
-                                d.get("Version"), d.get("Level"), pid_e, pid_c,
+                fournisseur = str(entete.get("ProviderId", "")).upper()
+                capture.append((fournisseur, ev[0], d.get("Version"), d.get("Level"),
+                                pid_e, pid_c,
                                 charge.get("Status") or charge.get("FailureCode")))
+                if "2F07E2EE" in fournisseur and ev[0] == TCPIP_CONNECT_BLOCKED:
+                    refus.append(charge)
         except Exception:
             pass
 
@@ -5034,24 +5040,30 @@ def selftest_wfp():
                 session.stop()
             except Exception:
                 pass
-            trouve = vu_1020()
-            note("OK" if trouve else "ATTENTION",
-                 "la tentative bloquee est visible (evenement TCPIP 1020)" if trouve else
-                 "tentative bloquee invisible : pas de carte de demande pour un "
-                 "programme bloque, le reste fonctionne")
-            # ce que Windows a emis pour cette connexion : de quoi regler la
-            # detection si l'evenement attendu n'est pas celui qui arrive
-            vus = {}
-            for prov, i, v, niv, pe, pc, st in list(capture):
-                nom = ("TCPIP" if "2F07E2EE" in prov else
-                       "Kernel-Network" if "7DD42A49" in prov else prov)
-                vus.setdefault((nom, i, v, niv), (pe, pc, st))
-            for (nom, i, v, niv), (pe, pc, st) in sorted(
-                    vus.items(), key=lambda kv: (kv[0][0], kv[0][1]))[:15]:
-                note("", "vu : %s %s v%s niveau %s - pid en-tete %s, pid champ %s%s"
-                     % (nom, i, v, niv, pe, pc, (", statut %s" % st) if st else ""))
-            if not vus:
-                note("", "aucun evenement de connexion recu pour ce programme")
+            # les evenements reels passent par le code de detection de NetGate :
+            # attribue au bon programme, vers la bonne adresse ?
+            detecteur = EtwMeter()
+            for charge in list(refus):
+                detecteur._bloque(charge)
+            vu = detecteur.drain()["bloques"].get(moi_pid)
+            note("OK" if vu else "ATTENTION",
+                 "une tentative bloquee est reconnue, programme et adresse (%s)" % vu
+                 if vu else "tentative bloquee non reconnue : pas de carte de demande "
+                            "pour un programme bloque, le reste fonctionne")
+            if not vu:
+                # ce que Windows a emis pour cette connexion : de quoi regler
+                # la detection si l'evenement attendu n'est pas celui qui arrive
+                vus = {}
+                for prov, i, v, niv, pe, pc, st in list(capture):
+                    nom = ("TCPIP" if "2F07E2EE" in prov else
+                           "Kernel-Network" if "7DD42A49" in prov else prov)
+                    vus.setdefault((nom, i, v, niv), (pe, pc, st))
+                for (nom, i, v, niv), (pe, pc, st) in sorted(
+                        vus.items(), key=lambda kv: (kv[0][0], kv[0][1]))[:15]:
+                    note("", "vu : %s %s v%s niveau %s - pid en-tete %s, pid champ %s%s"
+                         % (nom, i, v, niv, pe, pc, (", statut %s" % st) if st else ""))
+                if not vus:
+                    note("", "aucun evenement de connexion recu pour ce programme")
 
         f_ok = eng.add_filter("C4", 10, FWP_ACTION_PERMIT, [cond_moi, vers(TEST_ADRESSE[0])],
                               "NetGate test - autorisation")
