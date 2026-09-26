@@ -420,6 +420,12 @@ Réessayez avec `python -m pip install psutil pywintrace pystray pillow` (la
 forme `python -m pip` garantit qu'on installe bien pour le Python qui
 lancera le programme).
 
+**Plusieurs Python sur le même PC** — `python` et `py` peuvent désigner deux
+Python différents, dont un seul a les modules : NetGate démarre alors avec
+des fonctions en moins (pas de demandes, pas de détail par programme, pas
+d'icône). L'avertissement de démarrage et l'autotest affichent le chemin du
+Python réellement utilisé, avec la commande d'installation exacte à taper.
+
 **Plus rien ne se connecte, même les programmes autorisés** — la case
 **DNS/DHCP essentiels** n'est pas cochée dans les réglages. Sans résolution
 de noms, aucun programme ne sait où aller.
