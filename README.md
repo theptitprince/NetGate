@@ -11,15 +11,16 @@ jour s'épuise, et coupe Internet quand elle est vide.
 **À qui ça sert.** À quiconque vit sur une connexion comptée — partage de
 connexion mobile, clé 4G, forfait data limité, liaison satellite — où chaque
 mégaoctet a de la valeur et où une mise à jour lancée au mauvais moment peut
-vider un forfait en une heure. NetGate pilote le pare-feu Windows pour
-bloquer tout le trafic sortant, vous demande quoi faire dès qu'un programme
-tente de sortir, mesure l'enveloppe sur la carte réseau par laquelle
-passent les données, attribue à chaque programme ce qu'il échange avec
-Internet, et tient une enveloppe journalière avec alertes à 50, 80 et 100 %
-et coupure à 100 %. Il produit une liste d'autorisations qui vous survit
-d'un lancement à l'autre, un compteur par programme et par jour, et un
-blason dans la zone de notification qui se remplit avec votre
-consommation. Version actuelle : 1.4.
+vider un forfait en une heure. NetGate pose ses propres filtres dans le
+moteur de filtrage de Windows pour bloquer tout ce que vous n'avez pas
+autorisé, vous demande quoi faire dès qu'un programme tente de sortir,
+mesure l'enveloppe sur la carte réseau par laquelle passent les données,
+attribue à chaque programme ce qu'il échange avec Internet, et tient une
+enveloppe journalière avec alertes à 50, 80 et 100 % et coupure à 100 %.
+Il produit une liste d'autorisations qui vous survit d'un lancement à
+l'autre, un compteur par programme et par jour, et un blason dans la zone
+de notification qui se remplit avec votre consommation. Version actuelle :
+2.0.
 
 Python 3.8+ avec tkinter, `psutil`, `pywintrace`, `pystray` et `pillow` —
 Windows 10 ou 11, droits administrateur.
@@ -69,8 +70,8 @@ vous puissiez décider en connaissance de cause.
 
 ### Les droits administrateur
 
-Modifier le pare-feu Windows exige l'élévation : NetGate la demande lui-même
-au lancement (invite UAC). Si vous la refusez, il propose un **mode
+Filtrer les connexions exige l'élévation : NetGate la demande lui-même au
+lancement (invite UAC). Si vous la refusez, il propose un **mode
 limité** où l'interface et les compteurs fonctionnent, mais où rien n'est
 bloqué. C'est un bon mode pour observer avant de décider.
 
@@ -93,8 +94,10 @@ sections :
 
 | Section | Rôle |
 |---|---|
-| `Firewall` | génère et exécute les scripts `netsh advfirewall` |
-| `EtwMeter` | écoute le fournisseur Kernel-Network et attribue à chaque processus ses octets échangés avec Internet |
+| `WfpEngine` | la session dynamique dans le moteur de filtrage de Windows (WFP) : sous-couche, filtres, transactions |
+| `wfp_specs`, `WfpBackend` | traduisent la liste d'autorisations en filtres NetGate et n'appliquent que les différences |
+| `Firewall`, `NetshBackend` | le moteur de repli : des règles du pare-feu Windows posées par `netsh advfirewall` |
+| `EtwMeter` | écoute le fournisseur Kernel-Network et attribue à chaque processus ses octets échangés avec Internet ; repère les connexions refusées |
 | `NicMeter` | lit les compteurs des cartes réseau : la mesure de l'enveloppe |
 | `ConnScanner` | découvre les connexions ouvertes et signale les programmes sans décision |
 | `State` | charge et sauvegarde le fichier d'état, gère les périodes et les profils |
@@ -129,10 +132,24 @@ lancer NetGate sans fenêtre de console, remplacez `python` par `pythonw`.
 
 **Fermer la fenêtre ne quitte pas** : NetGate continue de surveiller et le
 blocage reste actif. Pour arrêter le programme, passez par le menu de
-l'icône (*Quitter*). À ce moment, toutes les règles créées sont supprimées
-et le pare-feu retrouve sa politique sortante d'origine. Ce détour est
-volontaire : une fermeture par mégarde ne doit jamais couper la surveillance
-en laissant croire qu'elle tourne.
+l'icône (*Quitter*). À ce moment, tous les filtres de NetGate disparaissent
+et Internet redevient normal. Ce détour est volontaire : une fermeture par
+mégarde ne doit jamais couper la surveillance en laissant croire qu'elle
+tourne.
+
+**Vérifier le moteur, une fois.** Avant la première utilisation sur un PC,
+NetGate fermé, lancez l'autotest :
+
+```powershell
+python netgate.py --test-wfp
+```
+
+Il demande les droits administrateur, vérifie en une quinzaine de secondes
+que le moteur de filtrage fonctionne sur ce PC, et laisse un rapport
+`netgate-test-wfp.txt`. Il ne touche à rien d'autre qu'à lui-même : ses
+filtres de test ne visent que sa propre connexion vers une adresse de
+documentation (`192.0.2.1`, inexistante sur Internet) ou vers localhost, et
+disparaissent à la fin. Avec l'exécutable : `NetGate.exe --test-wfp`.
 
 ---
 
@@ -157,44 +174,62 @@ Ensuite :
 Chaque carte de demande affiche le nom lisible du programme, son éditeur, à
 quoi il sert et un conseil, pour que vous n'ayez pas à deviner ce que cache
 `svchost.exe` ou `msedgewebview2.exe`. Trois réponses : *Autoriser*,
-*Bloquer*, *Plus tard*. La dernière laisse la question ouverte sans rien
-changer.
+*Bloquer*, *Plus tard*. La dernière laisse la question ouverte ; en
+attendant, le programme reste bloqué. Une carte marquée *Connexion bloquée*
+signale un programme qui vient d'essayer de sortir et a été refusé :
+autorisez-le, il réessaie de lui-même.
 
 ---
 
 ## 5. Comment ça marche
 
-NetGate n'est pas un pare-feu : il pilote **le pare-feu Windows** existant
-via `netsh advfirewall`. C'est ce qui le rend léger et prévisible : ce que
-vous voyez dans *Pare-feu Windows Defender avec fonctions avancées de
-sécurité* → *Règles de trafic sortant* est exactement ce qui s'applique.
+Depuis Windows Vista, tout pare-feu sous Windows, celui de Microsoft
+compris, pose ses filtres dans un même moteur : la **Windows Filtering
+Platform** (WFP). NetGate 2 y pose les siens directement, comme le font les
+pare-feu applicatifs à la ZoneAlarm, sans pilote à installer et sans toucher
+aux règles du pare-feu Windows.
 
-**Le blocage.** Quand la protection est active, la politique sortante des
-trois profils réseau (domaine, privé, public) passe à *bloquer*, puis une
-règle *autoriser* est créée par programme accepté et une règle *bloquer*
-par programme refusé. Toutes les règles de NetGate portent le préfixe
-`NETGATE_` ; les règles tierces ne sont jamais touchées. Les modifications
-sont regroupées dans un script `netsh -f` exécuté en une fois, parce que
-chaque appel `netsh` isolé coûte environ 200 ms et figerait l'interface.
+**Le blocage.** Quand la protection est active, NetGate ouvre une session
+dans le moteur et y crée sa propre sous-couche, de priorité maximale. Dans
+cette sous-couche, le filtre de plus fort poids qui correspond décide :
+localhost ouvert, puis réseau local ouvert, puis la coupure (enveloppe
+épuisée, hors plage horaire), puis un filtre *autoriser* par programme
+accepté, et enfin *tout le reste est bloqué*. Les programmes refusés ou
+encore en attente n'ont pas de filtre à eux : le blocage général s'applique.
+Chaque changement est appliqué d'un bloc, dans une transaction, et ne touche
+que les filtres qui changent.
 
-**Pourquoi des règles de blocage.** Windows et de nombreux logiciels posent
-leurs propres règles *autoriser* dans le pare-feu : applications du Store,
-services Windows, certains installateurs (plus d'une centaine sur un poste
-courant). Ces règles laissent passer leur programme malgré la politique
-*bloquer*. Une règle de blocage, elle, l'emporte toujours sur une règle
-d'autorisation : c'est ce qui rend *Bloquer* effectif, et ce qui rend la
-coupure (enveloppe épuisée, hors plage horaire) étanche. Ces règles ne
-visent que les adresses Internet : localhost et le réseau local restent
-ouverts. Exception : `svchost.exe` n'en reçoit jamais, car elle
-l'emporterait aussi sur la règle DNS/DHCP. Un programme encore en attente
-de réponse peut, lui, profiter d'une autorisation posée par Windows ou son
-installateur.
+**Pourquoi un moteur à soi.** Windows et de nombreux logiciels posent leurs
+propres règles *autoriser* dans le pare-feu Windows : applications du
+Store, services Windows, certains installateurs (plus d'une centaine sur un
+poste courant). Dans le pare-feu Windows, elles laissent passer leur
+programme malgré une politique *bloquer*. Dans le moteur, un blocage de la
+sous-couche NetGate est définitif : aucune de ces autorisations ne passe
+devant. *Bloquer* veut vraiment dire bloqué, et un programme en attente de
+réponse est bloqué lui aussi.
 
-**La règle DNS/DHCP « essentiels ».** Une règle facultative, cochée par
-défaut, laisse passer `svchost.exe` sur les ports 53 (DNS) et 67-68 (DHCP).
-Sans elle, même les programmes autorisés ne résolvent plus aucun nom et
-tout semble bloqué. Si tout se met à échouer, c'est le premier réglage à
-vérifier.
+**La session dynamique.** Les filtres de NetGate appartiennent à une session
+que Windows supprime dès que NetGate s'arrête, qu'il quitte normalement,
+plante ou soit tué. Rien ne peut rester bloqué à votre insu, et aucun
+nettoyage n'est nécessaire au démarrage suivant.
+
+**La règle DNS/DHCP « essentiels ».** Un filtre facultatif, coché par
+défaut, laisse passer `svchost.exe` vers les ports 53 (DNS), 67 et 547
+(DHCP). Sans lui, même les programmes autorisés ne résolvent plus aucun nom
+quand le serveur DNS est sur Internet (fréquent en 4G), et un modem en mode
+pont ne renouvelle plus l'adresse du PC. Si tout se met à échouer, c'est le
+premier réglage à vérifier.
+
+**Le moteur de repli.** Si le moteur NetGate ne peut pas s'ouvrir, ou s'il
+échoue en cours de route, NetGate bascule sur le moteur de la version 1 :
+des règles du pare-feu Windows posées par `netsh advfirewall`, toutes
+préfixées `NETGATE_`. La politique sortante passe à *bloquer*, une règle
+*autoriser* est créée par programme accepté et une règle *bloquer* par
+programme refusé ; une règle de blocage l'emporte sur toutes les
+autorisations de Windows. Ces règles survivent à NetGate : elles sont
+retirées en quittant, et au démarrage suivant après un arrêt brutal.
+Réglages → *Moteur de filtrage* pour choisir ce moteur ; le bandeau indique
+le moteur en service.
 
 **Le comptage de l'enveloppe.** L'enveloppe est mesurée sur la carte
 réseau par laquelle passent les données (Wi-Fi, Ethernet, clé 4G, partage
@@ -220,8 +255,13 @@ reste juste.
 
 **La découverte.** Toutes les 1,5 s, la liste des connexions ouvertes vers
 Internet est relevée et chaque exécutable qui n'a pas encore reçu de
-décision déclenche une carte de demande. Un programme qui ne parle qu'à
-localhost ou au réseau local ne déclenche rien.
+décision déclenche une carte de demande. Un programme bloqué, lui, n'a
+jamais de connexion ouverte : NetGate écoute donc aussi l'événement 1020 du
+fournisseur `Microsoft-Windows-TCPIP`, « connexion refusée par le moteur de
+filtrage », qui donne le processus et l'adresse visée. La carte apparaît
+alors avec la mention *Connexion bloquée* ; autorisez, et le programme
+réessaie de lui-même. Un programme qui ne parle qu'à localhost ou au
+réseau local ne déclenche rien.
 
 **Les mises à jour.** Beaucoup de programmes changent de dossier à chaque
 version (`claude_2.110…`, `app-1.0.9187`, `152.0.4191.66`). NetGate les
@@ -235,11 +275,11 @@ l'éditeur lus dans les ressources du fichier, la signature numérique, le
 titre de fenêtre, et pour `svchost.exe` le service Windows exact hébergé par
 ce processus.
 
-**La remise en état.** Au démarrage, NetGate supprime les règles `NETGATE_`
-restées d'une session interrompue (coupure de courant, processus tué), pour
-que rien ne reste bloqué à votre insu. Le bouton **PANIQUE** fait la même
-chose à la demande, immédiatement : toutes les règles disparaissent et
-Internet revient.
+**La remise en état.** Le bouton **PANIQUE** ferme la session NetGate :
+tous les filtres disparaissent immédiatement et Internet revient. Si la
+session précédente utilisait le moteur de repli et s'est interrompue
+(coupure de courant, processus tué), NetGate retire au démarrage les règles
+`NETGATE_` restées dans le pare-feu Windows.
 
 ---
 
@@ -393,16 +433,24 @@ pas installé, ou la session ETW n'a pas pu démarrer (droits administrateur
 refusés). L'enveloppe reste mesurée sur la carte réseau ; seul le détail
 par programme manque.
 
-**Un programme bloqué passe quand même** — il est sans doute encore *en
-attente* et profite d'une autorisation que Windows ou son installateur a
-posée. Répondez *Bloquer* : la règle de blocage l'emporte sur toutes les
-autorisations.
+**Le bandeau indique « filtrage : pare-feu Windows (repli) »** — le moteur
+NetGate n'a pas pu s'ouvrir ou a échoué ; la raison est dans les réglages
+(sous *Moteur de filtrage*) et dans `netgate.log`. Un autre NetGate tourne
+peut-être déjà. Pour vérifier le moteur sur ce PC, quittez NetGate et
+lancez l'autotest (`python netgate.py --test-wfp`, voir « Lancement »).
 
-**Internet est resté bloqué après un plantage** — relancez NetGate (il
-nettoie ses règles au démarrage), ou cliquez **PANIQUE**. En dernier
-recours, dans un PowerShell administrateur, la première commande rétablit
-la politique sortante d'origine, la seconde supprime toutes les règles
-`NETGATE_`, dont la coupure :
+**Un programme bloqué passe quand même** — avec le moteur NetGate, cela ne
+devrait pas arriver : vérifiez le bandeau. Avec le moteur de repli, le
+programme est sans doute encore *en attente* et profite d'une autorisation
+que Windows ou son installateur a posée ; répondez *Bloquer*, la règle de
+blocage l'emporte sur toutes les autorisations.
+
+**Internet est resté bloqué après un plantage** — avec le moteur NetGate,
+c'est impossible : ses filtres disparaissent avec lui. Avec le moteur de
+repli, relancez NetGate (il nettoie ses règles au démarrage), ou cliquez
+**PANIQUE**. En dernier recours, dans un PowerShell administrateur, la
+première commande rétablit la politique sortante d'origine, la seconde
+supprime toutes les règles `NETGATE_`, dont la coupure :
 
 ```powershell
 netsh advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound

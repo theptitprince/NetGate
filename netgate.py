@@ -53,8 +53,18 @@ V1.4  Coupure reelle a 100 % de l'enveloppe (case dans les reglages) avec
       reseau physique ; localhost, reseau local et tunnels VPN ne sont plus
       decomptes. Un programme mis a jour (dossier portant un numero de
       version) garde sa decision au lieu de reapparaitre en double.
+V2.0  Moteur de filtrage NetGate : les filtres vivent dans la Windows
+      Filtering Platform (WFP), dans une sous-couche prioritaire et une
+      session dynamique. Les autorisations posees par Windows ou par les
+      installateurs ne passent plus devant ; un programme en attente est
+      vraiment bloque ; si NetGate s'arrete ou plante, ses filtres
+      disparaissent d'eux-memes. Les connexions refusees sont detectees
+      (evenement TCPIP 1020) : carte de demande meme pour un programme qui
+      n'a jamais reussi a sortir. Repli automatique sur le pare-feu Windows.
+      Autotest sans risque : python netgate.py --test-wfp.
 """
 
+import contextlib
 import ctypes
 import glob
 import hashlib
@@ -70,6 +80,7 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import tkinter as tk
@@ -118,7 +129,7 @@ ANNEE = "2026"
 # Numerotation : V<majeure>.<mineure>, plus une lettre pour une retouche
 # mineure (V1.1a). La majeure change en cas de refonte, la mineure a chaque
 # ajout ou correction, la lettre pour un ajustement cosmetique.
-VERSION = "1.4"
+VERSION = "2.0"
 
 VERSION_TXT = "V" + VERSION
 COPYRIGHT = "%s \u00a9 %s" % (AUTEUR, ANNEE)
@@ -133,9 +144,16 @@ CREATE_NO_WINDOW = 0x08000000
 KERNEL_NETWORK_GUID = "{7DD42A49-5329-4832-8DFD-43D979153A88}"
 ETW_SENT_IDS = {10, 26, 42, 58}
 ETW_RECV_IDS = {11, 27, 43, 59}
-# Nom fixe : apres un arret brutal, la session ETW restee ouverte est reprise
-# au lieu d'en ouvrir une nouvelle a chaque lancement.
+# Nom fixe : apres un arret brutal, la session ETW restee ouverte est arretee
+# au lancement suivant au lieu de s'accumuler.
 ETW_SESSION = "NetGate-Reseau"
+# Microsoft-Windows-TCPIP, evenement 1020 : "connect failed: inspection
+# status", une connexion refusee par le moteur de filtrage. Niveau Erreur et
+# mot-cle ConnectPath : seuls les echecs de connexion remontent, pas le flot
+# des evenements TCP.
+TCPIP_GUID = "{2F07E2EE-15DB-40F1-90EF-9D7BA282188A}"
+TCPIP_CONNECT_BLOCKED = 1020
+TCPIP_KW_CONNECTPATH = 0x400000000
 
 # Adresses publiques, c'est-a-dire tout sauf localhost, reseaux prives,
 # liaison locale et multidiffusion. Les regles de blocage ne visent qu'elles :
@@ -273,6 +291,8 @@ DEFAULT_STATE = {
     "start_minimized": False,
     "nic_exclude": [],             # cartes physiques que l'utilisateur ne compte pas
     "nic_include": [],             # cartes virtuelles qu'il compte quand meme
+    "engine": "wfp",               # moteur de filtrage : "wfp" ou "netsh"
+    "backend_used": "",            # moteur de la derniere session protegee
     "active_profile": "defaut",
     "profiles": DEFAULT_PROFILES,
     "catalog": {},
@@ -295,8 +315,17 @@ def is_admin():
 
 
 def relaunch_as_admin():
-    params = " ".join('"%s"' % a for a in sys.argv)
-    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+    """Relance en administrateur, avec un chemin de script absolu et le meme
+    dossier de travail : le processus eleve demarre sinon dans System32, ou
+    "python netgate.py" ne trouve plus netgate.py."""
+    args = list(sys.argv)
+    if getattr(sys, "frozen", False):
+        args = args[1:]                 # l'executable n'est pas son propre argument
+    elif args:
+        args[0] = os.path.abspath(args[0])
+    params = " ".join('"%s"' % a for a in args)
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params,
+                                        os.getcwd(), 1)
 
 
 def fmt_bytes(n):
@@ -391,6 +420,20 @@ def addr_scope(ip, own=frozenset(), prefixes=frozenset()):
     if a.version == 6 and (int(a) >> 64) in prefixes:
         return "lan"
     return "internet"
+
+
+def sockaddr_ip(texte):
+    """Adresse IP d'une adresse de socket telle qu'ETW l'ecrit ("1.2.3.4:443",
+    "[2a01::1]:443", ou l'adresse seule). None si illisible."""
+    s = str(texte or "").strip()
+    if s.startswith("["):
+        s = s[1:s.find("]")] if "]" in s else s[1:]
+    elif s.count(":") == 1:
+        s = s.split(":")[0]
+    try:
+        return str(ipaddress.ip_address(s.split("%")[0]))
+    except ValueError:
+        return None
 
 
 def now_in(tz_mode):
@@ -566,6 +609,544 @@ class Firewall:
         return Firewall.run_script(lines)
 
 
+def message_regles(t, change, duree):
+    """Ligne d'etat apres application d'un plan (voir NetGateApp._fw_plan)."""
+    if not t["engaged"]:
+        return "Protection desactivee"
+    if t["cut"] == "enveloppe":
+        return ("Enveloppe epuisee : Internet coupe jusqu'a la remise a zero "
+                "(localhost et reseau local restent ouverts)")
+    if t["cut"] == "plage":
+        suite = t.get("suite")
+        return ("Hors plage horaire : Internet coupe" +
+                (" jusqu'a %s" % suite[1] if suite else ""))
+    if t["libre"]:
+        return "Profil %s : aucun filtrage, le compteur tourne" % t["nom"]
+    n = t.get("n_allow", len(t["allow"]))
+    if not change:
+        return "Protection active - %d programmes autorises" % n
+    return "Regles a jour en %.1f s : %d programmes autorises" % (duree, n)
+
+
+class NetshBackend:
+    """Moteur de la version 1 : des regles dans le pare-feu Windows, posees
+    par netsh. Elles survivent a NetGate : il faut les retirer en quittant,
+    et au demarrage suivant apres un arret brutal. Sert de repli quand le
+    moteur NetGate (WFP) ne peut pas s'ouvrir."""
+    nom = "pare-feu Windows"
+    cle = "netsh"
+
+    def __init__(self):
+        self.applied = {"engaged": None, "allow": set(), "block": set(),
+                        "cut": None, "ess": None, "lockdown": None}
+
+    def paths_in_use(self):
+        return self.applied["allow"] | self.applied["block"]
+
+    def close(self):
+        pass
+
+    def restore(self, known):
+        Firewall.panic_restore(known)
+        self.applied = {"engaged": False, "allow": set(), "block": set(),
+                        "cut": False, "ess": False, "lockdown": False}
+
+    def sync(self, t, full):
+        a = self.applied
+        debut = time.time()
+        lines = []
+
+        if not t["engaged"]:
+            if full or a["engaged"] is not False:
+                lines += Firewall.line_lockdown(False)
+                lines += Firewall.lines_cut(False)
+                for p in (t["known"] | a["allow"] | a["block"]) if full \
+                        else (a["allow"] | a["block"]):
+                    lines += Firewall.line_delete(p)
+                lines += Firewall.lines_essentials(False)
+            Firewall.run_script(lines)
+            self.applied = {"engaged": False, "allow": set(), "block": set(),
+                            "cut": False, "ess": False, "lockdown": False}
+            return message_regles(t, bool(lines), 0)
+
+        if full:
+            for p in t["known"] - t["allow"] - t["block"]:
+                lines += Firewall.line_delete(p)
+            # chaque ajout retire d'abord sa propre regle ; l'autre sorte de
+            # regle peut exister d'avant (programme passe de bloque a autorise)
+            for p in t["allow"]:
+                lines += Firewall.line_delete(p, ("BLK",))
+            for p in t["block"]:
+                lines += Firewall.line_delete(p, ("OUT",))
+            add_allow, add_block = t["allow"], t["block"]
+        else:
+            for p in a["allow"] - t["allow"]:
+                lines += Firewall.line_delete(p, ("OUT",))
+            for p in a["block"] - t["block"]:
+                lines += Firewall.line_delete(p, ("BLK",))
+            add_allow, add_block = t["allow"] - a["allow"], t["block"] - a["block"]
+        for p in sorted(add_allow):
+            lines += Firewall.line_allow(p, t["labels"].get(p, ""))
+        for p in sorted(add_block):
+            lines += Firewall.line_block(p, t["labels"].get(p, ""))
+        if full or t["ess"] != a["ess"]:
+            lines += Firewall.lines_essentials(t["ess"])
+        coupe = bool(t["cut"])
+        if full or coupe != a["cut"]:
+            lines += Firewall.lines_cut(coupe)
+        # la politique en dernier : les autorisations sont deja en place
+        if full or t["lockdown"] != a["lockdown"]:
+            lines += Firewall.line_lockdown(t["lockdown"])
+
+        Firewall.run_script(lines)
+        self.applied = {"engaged": True, "allow": set(t["allow"]),
+                        "block": set(t["block"]), "cut": coupe, "ess": t["ess"],
+                        "lockdown": t["lockdown"]}
+        return message_regles(t, bool(lines), time.time() - debut)
+
+
+# ==========================================================================
+#  MOTEUR DE FILTRAGE NETGATE (WFP)
+# ==========================================================================
+# Depuis Vista, tout pare-feu sous Windows, celui de Microsoft compris, pose
+# ses filtres dans un meme moteur : la Windows Filtering Platform (WFP).
+# NetGate V2 y pose les siens, dans sa propre sous-couche, au lieu d'ecrire
+# des regles dans le pare-feu Windows. Identifiants, structures et constantes
+# viennent de fwpmu.h, fwpmtypes.h et fwptypes.h du kit Windows.
+
+WFP_SUBLAYER = "d2155467-883e-4a40-a485-ae6132c934e2"   # propre a NetGate
+WFP_LAYERS = {
+    "C4": "c38d57d1-05a7-4c33-904f-7fbceee60e82",   # ALE_AUTH_CONNECT_V4 : sorties
+    "C6": "4a72393b-319f-44bc-84c3-ba54dcb3b6b4",   # ALE_AUTH_CONNECT_V6
+    "R4": "e1cd9fe7-f4b5-4273-96c0-592e487b8650",   # ALE_AUTH_RECV_ACCEPT_V4 : entrees
+    "R6": "a3b42c97-9f04-4672-b87e-cee9c483257f",   # ALE_AUTH_RECV_ACCEPT_V6
+}
+WFP_COND_APP_ID = "d78e1e87-8644-4ea5-9437-d809ecefc971"       # ALE_APP_ID
+WFP_COND_REMOTE_ADDRESS = "b235ae9a-1d64-49b8-a44c-5ff3d9095045"
+WFP_COND_REMOTE_PORT = "c35a604d-d22b-4e1a-91b4-68f674ee674b"
+WFP_COND_FLAGS = "632ce23b-5167-435c-86d7-e903684aa80c"
+
+FWP_UINT8, FWP_UINT16, FWP_UINT32 = 1, 2, 3
+FWP_BYTE_BLOB_TYPE = 12
+FWP_V4_ADDR_MASK, FWP_V6_ADDR_MASK = 0x100, 0x101
+FWP_MATCH_EQUAL, FWP_MATCH_FLAGS_ALL_SET = 0, 6
+FWP_ACTION_BLOCK, FWP_ACTION_PERMIT = 0x1001, 0x1002
+FWP_CONDITION_FLAG_IS_LOOPBACK = 0x1
+FWPM_SESSION_FLAG_DYNAMIC = 0x1
+RPC_C_AUTHN_WINNT = 10
+FWP_E_FILTER_NOT_FOUND = 0x80320003
+FWP_E_ALREADY_EXISTS = 0x80320009
+
+# Reseau local : jamais filtre, il ne consomme pas le forfait (224.0.0.0/3 :
+# multidiffusion et diffusion, dont le DHCP)
+WFP_LAN_V4 = (("127.0.0.0", 8), ("10.0.0.0", 8), ("172.16.0.0", 12),
+              ("192.168.0.0", 16), ("169.254.0.0", 16), ("224.0.0.0", 3))
+WFP_LAN_V6 = (("::1", 128), ("fe80::", 10), ("fc00::", 7), ("ff00::", 8))
+
+SVCHOST = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                       "System32", "svchost.exe").lower()
+
+
+class _GuidStruct(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+    @classmethod
+    def of(cls, texte):
+        return cls.from_buffer_copy(uuid.UUID(texte).bytes_le)
+
+    def __str__(self):
+        d4 = bytes(self.Data4)
+        return "{%08X-%04X-%04X-%s-%s}" % (self.Data1, self.Data2, self.Data3,
+                                           d4[:2].hex().upper(), d4[2:].hex().upper())
+
+
+class _FwpByteBlob(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_uint32), ("data", ctypes.c_void_p)]
+
+
+class _FwpmDisplayData0(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_wchar_p), ("description", ctypes.c_wchar_p)]
+
+
+class _FwpmSession0(ctypes.Structure):
+    _fields_ = [("sessionKey", _GuidStruct), ("displayData", _FwpmDisplayData0),
+                ("flags", ctypes.c_uint32), ("txnWaitTimeoutInMSec", ctypes.c_uint32),
+                ("processId", ctypes.c_ulong), ("sid", ctypes.c_void_p),
+                ("username", ctypes.c_wchar_p), ("kernelMode", ctypes.c_int)]
+
+
+class _FwpmSublayer0(ctypes.Structure):
+    _fields_ = [("subLayerKey", _GuidStruct), ("displayData", _FwpmDisplayData0),
+                ("flags", ctypes.c_uint32), ("providerKey", ctypes.c_void_p),
+                ("providerData", _FwpByteBlob), ("weight", ctypes.c_uint16)]
+
+
+class _FwpValueUnion(ctypes.Union):
+    _fields_ = [("uint8", ctypes.c_uint8), ("uint16", ctypes.c_uint16),
+                ("uint32", ctypes.c_uint32), ("ptr", ctypes.c_void_p)]
+
+
+class _FwpValue0(ctypes.Structure):
+    """FWP_VALUE0, et FWP_CONDITION_VALUE0 qui a la meme disposition."""
+    _anonymous_ = ("u",)
+    _fields_ = [("type", ctypes.c_int), ("u", _FwpValueUnion)]
+
+
+class _FwpV4AddrAndMask(ctypes.Structure):
+    _fields_ = [("addr", ctypes.c_uint32), ("mask", ctypes.c_uint32)]
+
+
+class _FwpV6AddrAndMask(ctypes.Structure):
+    _fields_ = [("addr", ctypes.c_uint8 * 16), ("prefixLength", ctypes.c_uint8)]
+
+
+class _FwpmFilterCondition0(ctypes.Structure):
+    _fields_ = [("fieldKey", _GuidStruct), ("matchType", ctypes.c_int),
+                ("conditionValue", _FwpValue0)]
+
+
+class _FwpmAction0(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_uint32), ("filterType", _GuidStruct)]
+
+
+class _FwpmFilterContext(ctypes.Union):
+    _fields_ = [("rawContext", ctypes.c_uint64), ("providerContextKey", _GuidStruct)]
+
+
+class _FwpmFilter0(ctypes.Structure):
+    """FWPM_FILTER0, 200 octets en 64 bits."""
+    _anonymous_ = ("ctx",)
+    _fields_ = [("filterKey", _GuidStruct), ("displayData", _FwpmDisplayData0),
+                ("flags", ctypes.c_uint32), ("providerKey", ctypes.c_void_p),
+                ("providerData", _FwpByteBlob), ("layerKey", _GuidStruct),
+                ("subLayerKey", _GuidStruct), ("weight", _FwpValue0),
+                ("numFilterConditions", ctypes.c_uint32),
+                ("filterCondition", ctypes.POINTER(_FwpmFilterCondition0)),
+                ("action", _FwpmAction0), ("ctx", _FwpmFilterContext),
+                ("reserved", ctypes.c_void_p), ("filterId", ctypes.c_uint64),
+                ("effectiveWeight", _FwpValue0)]
+
+
+def v4_mask(adresse, prefixe):
+    """(adresse, masque) en entiers, dans l'ordre des octets de la machine
+    comme WFP les attend."""
+    return (int(ipaddress.IPv4Address(adresse)),
+            (0xFFFFFFFF << (32 - prefixe)) & 0xFFFFFFFF)
+
+
+def v6_mask(adresse, prefixe):
+    return (ipaddress.IPv6Address(adresse).packed, prefixe)
+
+
+class WfpError(Exception):
+    def __init__(self, fonction, code):
+        self.code = code & 0xFFFFFFFF
+        super().__init__("%s : erreur 0x%08X" % (fonction, self.code))
+
+
+class WfpEngine:
+    """Session dynamique dans le moteur de filtrage de Windows. Tout ce que
+    NetGate y pose disparait quand la session se ferme, y compris si le
+    programme plante ou est tue : aucun filtre ne peut rester en place a
+    son insu, et aucun nettoyage n'est necessaire au demarrage suivant."""
+
+    def __init__(self):
+        self.h = None
+        self._dll = None
+        self._appids = {}
+
+    def _api(self):
+        if self._dll is None:
+            dll = ctypes.WinDLL("fwpuclnt")
+            V, P = ctypes.c_void_p, ctypes.POINTER
+            U32, U64, DW = ctypes.c_uint32, ctypes.c_uint64, ctypes.c_ulong
+            for nom, args, res in (
+                    ("FwpmEngineOpen0", [ctypes.c_wchar_p, U32, V, P(_FwpmSession0), P(V)], DW),
+                    ("FwpmEngineClose0", [V], DW),
+                    ("FwpmTransactionBegin0", [V, U32], DW),
+                    ("FwpmTransactionCommit0", [V], DW),
+                    ("FwpmTransactionAbort0", [V], DW),
+                    ("FwpmSubLayerAdd0", [V, P(_FwpmSublayer0), V], DW),
+                    ("FwpmFilterAdd0", [V, P(_FwpmFilter0), V, P(U64)], DW),
+                    ("FwpmFilterDeleteById0", [V, U64], DW),
+                    ("FwpmGetAppIdFromFileName0", [ctypes.c_wchar_p, P(P(_FwpByteBlob))], DW),
+                    ("FwpmFreeMemory0", [P(V)], None)):
+                f = getattr(dll, nom)
+                f.argtypes, f.restype = args, res
+            self._dll = dll
+        return self._dll
+
+    def _call(self, nom, *args):
+        rc = getattr(self._api(), nom)(*args)
+        if rc:
+            raise WfpError(nom, rc)
+
+    @staticmethod
+    def build_session():
+        s = _FwpmSession0()
+        s.displayData.name = "NetGate"
+        s.displayData.description = "Filtres de NetGate, retires avec lui"
+        s.flags = FWPM_SESSION_FLAG_DYNAMIC
+        s.txnWaitTimeoutInMSec = 5000
+        return s
+
+    @staticmethod
+    def build_sublayer():
+        sl = _FwpmSublayer0()
+        sl.subLayerKey = _GuidStruct.of(WFP_SUBLAYER)
+        sl.displayData.name = "NetGate"
+        sl.displayData.description = "Controle d'acces Internet par application"
+        sl.weight = 0xFFFF
+        return sl
+
+    def open(self):
+        """Ouvre la session et y cree la sous-couche NetGate. Sous-couche de
+        poids maximal : examinee en premier, un blocage de NetGate est
+        definitif, quelles que soient les autorisations des autres."""
+        s = self.build_session()
+        h = ctypes.c_void_p()
+        self._call("FwpmEngineOpen0", None, RPC_C_AUTHN_WINNT, None,
+                   ctypes.byref(s), ctypes.byref(h))
+        self.h = h
+        sl = self.build_sublayer()
+        try:
+            self._call("FwpmSubLayerAdd0", self.h, ctypes.byref(sl), None)
+        except WfpError as e:
+            self.close()
+            if e.code == FWP_E_ALREADY_EXISTS:
+                raise WfpError("sous-couche deja presente : un autre NetGate "
+                               "tourne-t-il deja ? FwpmSubLayerAdd0", e.code)
+            raise
+
+    def close(self):
+        """Fin de session : tous les filtres de NetGate disparaissent."""
+        if self.h:
+            try:
+                self._api().FwpmEngineClose0(self.h)
+            except Exception:
+                pass
+        self.h = None
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """Tout ou rien : le pare-feu ne passe jamais par un etat a moitie
+        applique."""
+        self._call("FwpmTransactionBegin0", self.h, 0)
+        try:
+            yield
+            self._call("FwpmTransactionCommit0", self.h)
+        except BaseException:
+            try:
+                self._api().FwpmTransactionAbort0(self.h)
+            except Exception:
+                pass
+            raise
+
+    def app_id(self, path):
+        """Identifiant WFP d'un programme (son chemin de peripherique), ou
+        None si le fichier n'existe pas. "System" designe le noyau."""
+        cle = path.lower()
+        blob = self._appids.get(cle)
+        if blob is None:
+            p = ctypes.POINTER(_FwpByteBlob)()
+            if self._api().FwpmGetAppIdFromFileName0(path, ctypes.byref(p)):
+                return None
+            try:
+                blob = ctypes.string_at(p.contents.data, p.contents.size)
+            finally:
+                brut = ctypes.c_void_p(ctypes.cast(p, ctypes.c_void_p).value)
+                self._api().FwpmFreeMemory0(ctypes.byref(brut))
+            self._appids[cle] = blob
+        return blob
+
+    def add_filter(self, couche, poids, action, conditions, nom):
+        """conditions : liste de (champ, correspondance, type, valeur).
+        Renvoie l'identifiant du filtre."""
+        f, garde = self.build_filter(couche, poids, action, conditions, nom)
+        fid = ctypes.c_uint64()
+        self._call("FwpmFilterAdd0", self.h, ctypes.byref(f), None, ctypes.byref(fid))
+        del garde
+        return fid.value
+
+    @staticmethod
+    def build_filter(couche, poids, action, conditions, nom):
+        """Construit FWPM_FILTER0. Renvoie (filtre, garde) : garde tient en vie
+        tout ce vers quoi le filtre pointe, jusqu'a l'appel a Windows."""
+        n = len(conditions)
+        conds = (_FwpmFilterCondition0 * max(1, n))()
+        garde = [conds]
+        for i, (champ, corresp, typ, val) in enumerate(conditions):
+            c = conds[i]
+            c.fieldKey = _GuidStruct.of(champ)
+            c.matchType = corresp
+            c.conditionValue.type = typ
+            if typ == FWP_UINT8:
+                c.conditionValue.uint8 = val
+            elif typ == FWP_UINT16:
+                c.conditionValue.uint16 = val
+            elif typ == FWP_UINT32:
+                c.conditionValue.uint32 = val
+            else:
+                if typ == FWP_BYTE_BLOB_TYPE:
+                    data = ctypes.create_string_buffer(val, len(val))
+                    obj = _FwpByteBlob(len(val), ctypes.addressof(data))
+                    garde.append(data)
+                elif typ == FWP_V4_ADDR_MASK:
+                    obj = _FwpV4AddrAndMask(*val)
+                elif typ == FWP_V6_ADDR_MASK:
+                    obj = _FwpV6AddrAndMask()
+                    obj.addr[:] = list(val[0])
+                    obj.prefixLength = val[1]
+                else:
+                    raise ValueError("type de condition non gere : %s" % typ)
+                garde.append(obj)
+                c.conditionValue.ptr = ctypes.addressof(obj)
+        f = _FwpmFilter0()
+        f.displayData.name = nom[:120]
+        f.layerKey = _GuidStruct.of(WFP_LAYERS[couche])
+        f.subLayerKey = _GuidStruct.of(WFP_SUBLAYER)
+        f.weight.type = FWP_UINT8
+        f.weight.uint8 = poids
+        f.numFilterConditions = n
+        if n:
+            f.filterCondition = ctypes.cast(conds, ctypes.POINTER(_FwpmFilterCondition0))
+        f.action.type = action
+        return f, garde
+
+    def delete_filter(self, fid):
+        rc = self._api().FwpmFilterDeleteById0(self.h, fid)
+        if rc and (rc & 0xFFFFFFFF) != FWP_E_FILTER_NOT_FOUND:
+            raise WfpError("FwpmFilterDeleteById0", rc)
+
+
+def wfp_specs(t):
+    """Les filtres voulus pour un plan (voir NetGateApp._fw_plan), sous la
+    forme {cle: (couche, poids, action, conditions, nom)}. Dans une sous-couche,
+    le filtre de plus fort poids qui correspond decide :
+
+      15  localhost ouvert         14  reseau local ouvert
+      13  coupure (enveloppe, plage horaire) : tout le reste est bloque
+      12  DNS et DHCP de svchost (case DNS/DHCP)
+      10  un filtre par programme autorise
+       1  tout le reste est bloque (sauf profil sans filtrage)
+
+    Les programmes bloques ou en attente n'ont pas de filtre a eux : le
+    blocage general s'applique, et aucune autorisation posee par Windows ou
+    par un installateur ne passe devant. Une valeur ("app", chemin) est
+    remplacee par l'identifiant WFP du programme au moment de la pose."""
+    specs = {}
+    if not t["engaged"]:
+        return specs
+    for couche in ("C4", "C6", "R4", "R6"):
+        v6 = couche.endswith("6")
+        specs[(couche, "localhost")] = (
+            couche, 15, FWP_ACTION_PERMIT,
+            [(WFP_COND_FLAGS, FWP_MATCH_FLAGS_ALL_SET, FWP_UINT32,
+              FWP_CONDITION_FLAG_IS_LOOPBACK)], "NetGate - localhost")
+        specs[(couche, "lan")] = (
+            couche, 14, FWP_ACTION_PERMIT,
+            [(WFP_COND_REMOTE_ADDRESS, FWP_MATCH_EQUAL,
+              FWP_V6_ADDR_MASK if v6 else FWP_V4_ADDR_MASK,
+              v6_mask(*r) if v6 else v4_mask(*r))
+             for r in (WFP_LAN_V6 if v6 else WFP_LAN_V4)],
+            "NetGate - reseau local")
+        if t["cut"]:
+            specs[(couche, "coupure")] = (couche, 13, FWP_ACTION_BLOCK, [],
+                                          "NetGate - Internet coupe")
+        if t["libre"]:
+            continue
+        if t["ess"]:
+            # DNS (53) et DHCP (67, 547 en IPv6) : un serveur DHCP est sur
+            # Internet quand le modem est en pont ; sans renouvellement du
+            # bail, la connexion tomberait au bout de quelques heures. Aussi
+            # en entree : l'offre DHCP vient d'une adresse que le client n'a
+            # pas "appelee". Les conditions sur un meme champ s'additionnent (OU).
+            specs[(couche, "dns")] = (
+                couche, 12, FWP_ACTION_PERMIT,
+                [(WFP_COND_APP_ID, FWP_MATCH_EQUAL, FWP_BYTE_BLOB_TYPE,
+                  ("app", t.get("svchost", SVCHOST)))] +
+                [(WFP_COND_REMOTE_PORT, FWP_MATCH_EQUAL, FWP_UINT16, port)
+                 for port in (53, 67, 547)],
+                "NetGate - DNS et DHCP")
+        for p in t["allow"]:
+            specs[(couche, "app", p.lower())] = (
+                couche, 10, FWP_ACTION_PERMIT,
+                [(WFP_COND_APP_ID, FWP_MATCH_EQUAL, FWP_BYTE_BLOB_TYPE, ("app", p))],
+                "NetGate - " + (t["labels"].get(p) or os.path.basename(p)))
+        specs[(couche, "reste")] = (couche, 1, FWP_ACTION_BLOCK, [],
+                                    "NetGate - tout le reste")
+    return specs
+
+
+class WfpBackend:
+    """Moteur de la version 2 : les filtres de NetGate dans le moteur de
+    filtrage de Windows, independants des regles du pare-feu Windows."""
+    nom = "moteur NetGate (WFP)"
+    cle = "wfp"
+
+    def __init__(self):
+        self.eng = WfpEngine()
+        self.ids = {}           # cle de filtre -> identifiant WFP
+        self._absents = set()   # programmes introuvables deja signales
+
+    def open(self):
+        self.eng.open()
+        self.ids = {}
+
+    def paths_in_use(self):
+        return set()            # rien ne survit a la session : rien a nettoyer
+
+    def close(self):
+        self.eng.close()
+        self.ids = {}
+
+    def restore(self, known=()):
+        """PANIQUE, fermeture : fin de la session, donc de tous les filtres.
+        Le plus sur des nettoyages ; la session se rouvre a la synchro
+        suivante."""
+        self.close()
+
+    def _poser(self, spec):
+        couche, poids, action, conds, nom = spec
+        reelles = []
+        for champ, corresp, typ, val in conds:
+            if isinstance(val, tuple) and len(val) == 2 and val[0] == "app":
+                blob = self.eng.app_id(val[1])
+                if blob is None:
+                    if val[1] not in self._absents:
+                        self._absents.add(val[1])
+                        log_line("WFP : programme introuvable, pas de filtre : %s" % val[1])
+                    return None
+                val = blob
+            reelles.append((champ, corresp, typ, val))
+        return self.eng.add_filter(couche, poids, action, reelles, nom)
+
+    def sync(self, t, full):
+        debut = time.time()
+        if self.eng.h is None:
+            self.open()
+            full = True
+        voulu = wfp_specs(t)
+        if full:
+            a_retirer, a_poser = dict(self.ids), voulu
+        else:
+            a_retirer = {k: v for k, v in self.ids.items() if k not in voulu}
+            a_poser = {k: v for k, v in voulu.items() if k not in self.ids}
+        if a_retirer or a_poser:
+            ids = dict(self.ids)
+            with self.eng.transaction():
+                for k, fid in a_retirer.items():
+                    self.eng.delete_filter(fid)
+                    ids.pop(k, None)
+                for k, spec in a_poser.items():
+                    fid = self._poser(spec)
+                    if fid is not None:
+                        ids[k] = fid
+            self.ids = ids      # seulement une fois la transaction validee
+        return message_regles(t, bool(a_retirer or a_poser), time.time() - debut)
+
+
 # ==========================================================================
 #  COMPTEUR ETW
 # ==========================================================================
@@ -586,6 +1167,7 @@ class EtwMeter(threading.Thread):
         self._reset_acc()
         self.mode = "init"
         self.error = ""
+        self.detection = False      # evenement 1020 recu : refus visibles
         self._job = None
         self._scopes = {}
         self.own = frozenset(("127.0.0.1", "::1"))
@@ -597,6 +1179,7 @@ class EtwMeter(threading.Thread):
         self._inet = [0, 0]         # tout le trafic Internet, toutes cartes
         self._lan = [0, 0]          # reseau local passe par une carte decomptee
         self._local = 0             # localhost + reseau local, pour information
+        self._bloques = {}          # pid -> adresse : connexions refusees
 
     def set_addresses(self, own, counted, prefixes):
         """Adresses de la machine, adresses des cartes decomptees, prefixes
@@ -607,7 +1190,7 @@ class EtwMeter(threading.Thread):
     def drain(self):
         with self._lock:
             out = {"apps": self._acc, "inet": self._inet, "lan": self._lan,
-                   "local": self._local}
+                   "local": self._local, "bloques": self._bloques}
             self._reset_acc()
         return out
 
@@ -643,12 +1226,27 @@ class EtwMeter(threading.Thread):
                     continue
         return None
 
+    def _bloque(self, payload):
+        """Connexion refusee par le moteur de filtrage : le signal d'une
+        demande, meme pour un programme qui n'a jamais reussi a sortir."""
+        pid = self._pick(payload, ("ProcessId", "PID"))
+        if not pid:
+            return
+        ip = sockaddr_ip(payload.get("RemoteAddress"))
+        if ip and self._scope(ip)[0] != "internet":
+            return
+        with self._lock:
+            self._bloques.setdefault(pid, ip or "?")
+
     def _callback(self, event):
         try:
             event_id, payload = event[0], event[1]
         except Exception:
             return
         if not isinstance(payload, dict):
+            return
+        if event_id == TCPIP_CONNECT_BLOCKED:
+            self._bloque(payload)
             return
         sens = 0 if event_id in ETW_SENT_IDS else 1
         if sens == 1 and event_id not in ETW_RECV_IDS:
@@ -672,26 +1270,54 @@ class EtwMeter(threading.Thread):
             if sa != sb and (ca if sa == "self" else cb) in self.counted:
                 self._lan[sens] += size
 
+    @staticmethod
+    def _arreter_session(nom):
+        """Arrete une session ETW de ce nom laissee par un arret brutal : la
+        reprendre telle quelle garderait ses anciens abonnements."""
+        try:
+            from etw import evntrace as et
+            from etw.etw import TraceProperties
+            et.ControlTraceW(0, nom, TraceProperties().get(), et.EVENT_TRACE_CONTROL_STOP)
+        except Exception:
+            pass
+
     def run(self):
         if _etw is None or _GUID is None:
             self.mode, self.error = "off", "pywintrace absent"
             return
+        self._arreter_session(ETW_SESSION)
+        compteur = _etw.ProviderInfo("Microsoft-Windows-Kernel-Network",
+                                     _GUID(KERNEL_NETWORK_GUID))
+        # les evenements hors envoi, reception et refus ne sont meme pas decodes
+        ids = sorted(ETW_SENT_IDS | ETW_RECV_IDS | {TCPIP_CONNECT_BLOCKED})
+        essais = [[compteur]]
         try:
-            providers = [_etw.ProviderInfo("Microsoft-Windows-Kernel-Network",
-                                           _GUID(KERNEL_NETWORK_GUID))]
+            essais.insert(0, [compteur, _etw.ProviderInfo(
+                "Microsoft-Windows-TCPIP", _GUID(TCPIP_GUID), level=2,
+                any_keywords=TCPIP_KW_CONNECTPATH)])
+        except Exception:
+            pass
+        for providers in essais:
             try:
-                # les evenements hors envoi/reception ne sont meme pas decodes
-                self._job = _etw.ETW(session_name=ETW_SESSION, providers=providers,
-                                     event_callback=self._callback,
-                                     event_id_filters=sorted(ETW_SENT_IDS | ETW_RECV_IDS))
-            except TypeError:       # pywintrace trop ancien pour ces options
-                self._job = _etw.ETW(providers=providers, event_callback=self._callback)
-            self._job.start()
-            self.mode = "etw"
-        except Exception as e:
-            self.mode, self.error = "off", str(e)
-            log_line("comptage par programme indisponible : %s" % e)
+                try:
+                    self._job = _etw.ETW(session_name=ETW_SESSION, providers=providers,
+                                         event_callback=self._callback,
+                                         event_id_filters=ids)
+                except TypeError:       # pywintrace trop ancien pour ces options
+                    self._job = _etw.ETW(providers=providers,
+                                         event_callback=self._callback)
+                self._job.start()
+                self.mode = "etw"
+                self.detection = len(providers) > 1
+                break
+            except Exception as e:
+                self.mode, self.error = "off", str(e)
+                self._arreter_session(ETW_SESSION)
+        if self.mode != "etw":
+            log_line("comptage par programme indisponible : %s" % self.error)
             return
+        if not self.detection:
+            log_line("detection des connexions refusees indisponible")
         self._stop.wait()
         try:
             self._job.stop()
@@ -702,16 +1328,6 @@ class EtwMeter(threading.Thread):
 # ==========================================================================
 #  COMPTEUR DES CARTES RESEAU
 # ==========================================================================
-
-class _GuidStruct(ctypes.Structure):
-    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
-                ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
-
-    def __str__(self):
-        d4 = bytes(self.Data4)
-        return "{%08X-%04X-%04X-%s-%s}" % (self.Data1, self.Data2, self.Data3,
-                                           d4[:2].hex().upper(), d4[2:].hex().upper())
-
 
 class _MibIfRow2(ctypes.Structure):
     """MIB_IF_ROW2 (netioapi.h), 1352 octets en 64 bits."""
@@ -893,12 +1509,20 @@ class ConnScanner(threading.Thread):
             self.pid_cache[pid] = (exe, ct)
         return exe
 
-    def _report(self, exe, pid, src):
+    def _report(self, exe, pid, src, bloque=False):
         path = exe.lower()
         if path in self.reported:
             return
         self.reported.add(path)
-        self.q.put({"path": exe, "pid": pid, "ts": time.time(), "src": src})
+        self.q.put({"path": exe, "pid": pid, "ts": time.time(), "src": src,
+                    "bloque": bloque})
+
+    def signal_blocked(self, pid):
+        """Connexion refusee par le pare-feu (evenement ETW) : une demande,
+        meme si le programme n'a encore jamais reussi a sortir."""
+        exe = self.exe_for(pid)
+        if exe:
+            self._report(exe, pid, "conn", bloque=True)
 
     def _scan_connections(self):
         pids = set()
@@ -1770,7 +2394,9 @@ class AuthToast(tk.Toplevel):
         tk.Frame(body, bg=color, height=4).pack(fill="x")
 
         pad = 20
-        tk.Label(body, text="Demande d'acces Internet", bg=C_PANEL, fg=C_TXT_DIM,
+        entete = ("Connexion bloquee - autoriser ce programme ?" if item.get("bloque")
+                  else "Demande d'acces Internet")
+        tk.Label(body, text=entete, bg=C_PANEL, fg=C_TXT_DIM,
                  font=("Segoe UI", 9)).pack(anchor="w", padx=pad, pady=(12, 0))
 
         # Titre le plus parlant possible
@@ -2139,20 +2765,25 @@ HELP = [
           "utiliser les premieres heures pour decouvrir qui consomme quoi sans rien "
           "casser."),
     ("h2", "Protection active"),
-    ("p", "NetGate donne ses ordres au pare-feu de Windows : le trafic sortant est "
-          "refuse par defaut sur les trois profils reseau ; une autorisation est creee "
-          "pour chaque programme autorise, une regle de blocage pour chaque programme "
-          "bloque ; la regle DNS/DHCP est posee si tu l'as cochee.\n\n"
-          "Pourquoi des regles de blocage ? Windows et beaucoup de logiciels "
-          "installent leurs propres autorisations (applications du Store, services "
-          "Windows, certains logiciels). Elles continuent de laisser passer leur "
-          "programme malgre le refus par defaut. Une regle de blocage, elle, "
-          "l'emporte toujours : Bloquer veut vraiment dire bloque. Un programme "
-          "encore en attente de reponse peut, lui, passer par ces autorisations-la."),
-    ("warn", "Ces regles vivent dans Windows, pas dans NetGate. En quittant "
-             "normalement, NetGate les supprime toutes et Internet redevient normal. "
-             "Si le programme est tue brutalement, le blocage reste en place : "
-             "relance NetGate, ou utilise le bouton PANIQUE."),
+    ("p", "NetGate pose ses propres filtres dans le moteur de filtrage de Windows "
+          "(la Windows Filtering Platform, celle qu'utilisent tous les pare-feu). "
+          "Localhost et le reseau local restent toujours ouverts ; chaque programme "
+          "autorise peut sortir ; tout le reste est bloque, y compris les programmes "
+          "encore en attente de reponse. Les autorisations que Windows ou les "
+          "installateurs ont posees dans le pare-feu Windows ne passent pas devant : "
+          "Bloquer veut vraiment dire bloque.\n\n"
+          "Quand un programme non autorise essaie de sortir, sa connexion est "
+          "refusee et une carte de demande apparait, meme s'il n'a jamais reussi a "
+          "sortir. Autorise-le : il reessaiera de lui-meme."),
+    ("warn", "Les filtres de NetGate vivent dans une session attachee au programme : "
+             "s'il se ferme, plante ou est tue, ils disparaissent d'eux-memes et "
+             "Internet redevient normal. Rien ne peut rester bloque a ton insu."),
+    ("h2", "Le moteur de repli"),
+    ("p", "Si le moteur NetGate ne peut pas s'ouvrir, NetGate utilise celui de la "
+          "version 1 : des regles dans le pare-feu Windows. Tu peux aussi le choisir "
+          "dans Reglages, Moteur de filtrage. Ces regles-la survivent a NetGate : "
+          "apres un arret brutal, relance NetGate ou utilise le bouton PANIQUE. Le "
+          "bandeau indique le moteur en service."),
 
     ("h1", "Premier demarrage, dans l'ordre"),
     ("p", "1. Reglages : enveloppe du jour, heure de remise a zero, case DNS/DHCP.\n"
@@ -2165,7 +2796,9 @@ HELP = [
     ("p", "Des qu'un programme essaie de sortir, une carte apparait en bas a droite "
           "avec son nom lisible, son editeur, ce a quoi il sert et un conseil. Trois "
           "reponses : Autoriser, Bloquer, ou Plus tard, qui met la demande en attente "
-          "sans rien decider. Le bouton Details montre le chemin du fichier, la "
+          "sans rien decider ; en attendant, le programme reste bloque. La mention "
+          "\"Connexion bloquee\" signale un programme qui vient d'etre refuse : "
+          "autorise-le, il reessaiera de lui-meme. Le bouton Details montre le chemin du fichier, la "
           "signature numerique, le site contacte et, pour svchost, le service exact "
           "qui se cache derriere."),
 
@@ -2254,8 +2887,8 @@ HELP = [
     ("p", "Les fichiers sont ranges a cote de netgate.py. netgate.state.json "
           "contient tout : reglages, autorisations, compteurs, historique. "
           "Copie-le ailleurs pour sauvegarder ta configuration. netgate.log recoit les "
-          "erreurs eventuelles. Les regles creees dans le pare-feu Windows portent "
-          "toutes le prefixe NETGATE_."),
+          "erreurs eventuelles. Les filtres du moteur NetGate s'appellent \"NetGate - "
+          "...\" ; les regles du moteur de repli portent le prefixe NETGATE_."),
 
     ("h1", "A propos"),
     ("about", ""),
@@ -2268,10 +2901,13 @@ HELP = [
           "Le bandeau indique \"sans detail par programme\" : le module pywintrace "
           "n'est pas installe, ou NetGate tourne sans droits administrateur. "
           "L'enveloppe reste mesuree sur la carte reseau.\n"
-          "Un programme bloque passe quand meme : il est peut-etre encore en attente "
-          "de reponse, et profite d'une autorisation que Windows ou son installateur "
-          "a posee. Reponds Bloquer : une regle de blocage l'emporte sur toutes les "
-          "autorisations.\n"
+          "Le bandeau indique \"filtrage : pare-feu Windows (repli)\" : le moteur "
+          "NetGate n'a pas pu s'ouvrir, la raison est dans Reglages et dans "
+          "netgate.log. Un autre NetGate tourne peut-etre deja.\n"
+          "Pour verifier le moteur NetGate sur ce PC, quitte NetGate puis lance "
+          "\"python netgate.py --test-wfp\" (ou \"NetGate.exe --test-wfp\") : un "
+          "autotest sans risque, qui ne touche qu'a lui-meme et laisse un rapport "
+          "netgate-test-wfp.txt.\n"
           "En cas de doute, PANIQUE retablit Internet immediatement."),
 ]
 
@@ -2285,6 +2921,10 @@ class NetGateApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.state_mgr = State()
+        # etat de la session precedente, fige avant que quoi que ce soit ne
+        # le reecrive (voir _legacy_cleanup)
+        self._precedente = (bool(self.state_mgr.data.get("engaged")),
+                            self.state_mgr.data.get("backend_used", ""))
         self.pending_q = queue.Queue()
         self.pending = []
         self.toast = None
@@ -2298,8 +2938,7 @@ class NetGateApp(tk.Tk):
         self._fw_full = False
         self._fw_target = None
         self._fw_msgs = queue.Queue()
-        self.applied = {"engaged": None, "allow": set(), "block": set(),
-                        "cut": None, "ess": None, "lockdown": None}
+        self._backend_note = ""   # pourquoi le moteur NetGate n'est pas utilise
         self._cut_state = "?"     # raison de coupure au dernier passage
         self.sort_key = "acces"   # colonne de tri de la liste principale
         self.sort_desc = False
@@ -2316,6 +2955,7 @@ class NetGateApp(tk.Tk):
         self.env_source = "carte" if self.nic.available else ("etw" if _etw else None)
         self.scanner = ConnScanner(self.pending_q)
         self.tray = Tray(self)
+        self.backend = self._choose_backend()
 
         self.title("%s %s  -  mon enveloppe Internet" % (APP_NAME, VERSION_TXT))
         self.geometry("1060x780")
@@ -2643,11 +3283,12 @@ class NetGateApp(tk.Tk):
 
     def quit_app(self):
         """En quittant, NetGate remet toujours Internet dans son etat normal :
-        politique sortante par defaut et suppression de toutes les regles
-        NETGATE_. Aucune question, rien ne peut rester bloque."""
+        plus aucun filtre ni aucune regle NETGATE_. Aucune question, rien ne
+        peut rester bloque."""
         try:
             self._restore_now()
-            log_line("fermeture : regles NETGATE_ supprimees, sortant retabli")
+            self.backend.close()
+            log_line("fermeture : filtres et regles de NetGate supprimes")
         except Exception:
             log_error("nettoyage du pare-feu a la fermeture")
         self.state_mgr.save()
@@ -2657,6 +3298,49 @@ class NetGateApp(tk.Tk):
         self.destroy()
 
     # -------------------------------------------------------------- moteur
+    def _choose_backend(self):
+        """Le moteur NetGate (WFP) si les reglages le demandent et qu'il
+        s'ouvre ; sinon le pare-feu Windows, moteur de la version 1."""
+        self._backend_note = ""
+        if self.state_mgr.data.get("engine", "wfp") == "wfp":
+            if not is_admin():
+                self._backend_note = "sans droits administrateur"
+            else:
+                b = WfpBackend()
+                try:
+                    b.open()
+                    return b
+                except Exception as e:
+                    self._backend_note = str(e)
+                    log_line("moteur NetGate (WFP) indisponible, repli sur le "
+                             "pare-feu Windows : %s" % e)
+        return NetshBackend()
+
+    def _switch_backend(self):
+        """Changement de moteur depuis les reglages : l'ancien retire tout ce
+        qu'il avait pose, le nouveau reprend tout."""
+        self._fw_wait_idle()
+        try:
+            self.backend.restore(self._all_known_paths())
+            self.backend.close()
+        except Exception:
+            log_error("retrait de l'ancien moteur")
+        self.backend = self._choose_backend()
+        log_line("moteur de filtrage : %s" % self.backend.nom)
+        if self.state_mgr.data["engaged"]:
+            self.apply_firewall(full=True)
+
+    def _legacy_cleanup(self):
+        """Une session du pare-feu Windows (version 1, ou repli) s'est arretee
+        brutalement protection active : ses regles et la politique "bloquer"
+        sont restees dans Windows. Le moteur NetGate ne les retire pas de
+        lui-meme ; elles bloqueraient ce qu'il autorise."""
+        engagee, moteur = self._precedente
+        if isinstance(self.backend, WfpBackend) and engagee and moteur != "wfp":
+            Firewall.panic_restore(self._all_known_paths())
+            log_line("regles du pare-feu Windows laissees par une session "
+                     "precedente : supprimees")
+
     def _all_known_paths(self):
         """Tous les chemins exacts pour lesquels une regle a pu etre posee."""
         sm = self.state_mgr
@@ -2669,7 +3353,7 @@ class NetGateApp(tk.Tk):
                 paths.add(key)
         for prof in sm.data["profiles"].values():
             paths.update(k for k in prof.get("apps", {}) if "*" not in k)
-        paths |= self.applied["allow"] | self.applied["block"]
+        paths |= self.backend.paths_in_use()
         paths.discard("")
         return paths
 
@@ -2682,8 +3366,12 @@ class NetGateApp(tk.Tk):
         plan = {"engaged": bool(d["engaged"]), "known": self._all_known_paths(),
                 "libre": bool(sm.profile.get("allow_all")), "nom": sm.profile_name(),
                 "allow": set(), "block": set(), "labels": {},
-                "cut": sm.cut_reason(), "ess": bool(d["essentials_dns"])}
+                "cut": sm.cut_reason(), "ess": bool(d["essentials_dns"]),
+                "suite": sm.schedule_next_change(), "svchost": SVCHOST,
+                "n_allow": len(sm.allowed_keys())}
         plan["lockdown"] = not plan["libre"]
+        if plan["engaged"]:
+            d["backend_used"] = self.backend.cle
         if not plan["engaged"] or plan["libre"]:
             return plan
         for keys, cible in ((sm.allowed_keys(), plan["allow"]),
@@ -2731,13 +3419,28 @@ class NetGateApp(tk.Tk):
                 full, self._fw_full = self._fw_full, False
                 target = self._fw_target
             try:
-                msg = self._fw_sync(target, full)
-            except Exception:
-                log_error("application des regles au pare-feu")
-                msg = "Erreur pare-feu, voir netgate.log"
-                with self._fw_lock:
-                    self._fw_full = True        # la prochaine fois, tout reprendre
+                msg = self.backend.sync(target, full)
+            except Exception as e:
+                log_error("application des regles (%s)" % self.backend.nom)
+                msg = self._fw_fallback(target, e)
             self._fw_msgs.put(msg)
+
+    def _fw_fallback(self, target, erreur):
+        """Le moteur NetGate a echoue : sa session est fermee (ses filtres
+        disparaissent) et le pare-feu Windows, moteur eprouve de la
+        version 1, prend le relais pour que la protection continue."""
+        if not isinstance(self.backend, WfpBackend):
+            with self._fw_lock:
+                self._fw_full = True            # la prochaine fois, tout reprendre
+            return "Erreur pare-feu, voir netgate.log"
+        ancien, self.backend = self.backend, NetshBackend()
+        ancien.close()
+        self._backend_note = "erreur : %s" % erreur
+        try:
+            return self.backend.sync(target, True) + "  (repli : pare-feu Windows)"
+        except Exception:
+            log_error("repli sur le pare-feu Windows")
+            return "Erreur pare-feu, voir netgate.log"
 
     def _fw_wait_idle(self, timeout=20.0):
         """Annule ce qui restait a appliquer et attend la fin du fil du
@@ -2757,75 +3460,7 @@ class NetGateApp(tk.Tk):
         effacement des autorisations)."""
         self.state_mgr.data["engaged"] = False
         self._fw_wait_idle()
-        Firewall.panic_restore(self._all_known_paths())
-        self.applied = {"engaged": False, "allow": set(), "block": set(),
-                        "cut": False, "ess": False, "lockdown": False}
-
-    def _fw_sync(self, t, full):
-        a = self.applied
-        debut = time.time()
-        lines = []
-
-        if not t["engaged"]:
-            if full or a["engaged"] is not False:
-                lines += Firewall.line_lockdown(False)
-                lines += Firewall.lines_cut(False)
-                for p in (t["known"] | a["allow"] | a["block"]) if full \
-                        else (a["allow"] | a["block"]):
-                    lines += Firewall.line_delete(p)
-                lines += Firewall.lines_essentials(False)
-            Firewall.run_script(lines)
-            self.applied = {"engaged": False, "allow": set(), "block": set(),
-                            "cut": False, "ess": False, "lockdown": False}
-            return "Protection desactivee"
-
-        if full:
-            for p in t["known"] - t["allow"] - t["block"]:
-                lines += Firewall.line_delete(p)
-            # chaque ajout retire d'abord sa propre regle ; l'autre sorte de
-            # regle peut exister d'avant (programme passe de bloque a autorise)
-            for p in t["allow"]:
-                lines += Firewall.line_delete(p, ("BLK",))
-            for p in t["block"]:
-                lines += Firewall.line_delete(p, ("OUT",))
-            add_allow, add_block = t["allow"], t["block"]
-        else:
-            for p in a["allow"] - t["allow"]:
-                lines += Firewall.line_delete(p, ("OUT",))
-            for p in a["block"] - t["block"]:
-                lines += Firewall.line_delete(p, ("BLK",))
-            add_allow, add_block = t["allow"] - a["allow"], t["block"] - a["block"]
-        for p in sorted(add_allow):
-            lines += Firewall.line_allow(p, t["labels"].get(p, ""))
-        for p in sorted(add_block):
-            lines += Firewall.line_block(p, t["labels"].get(p, ""))
-        if full or t["ess"] != a["ess"]:
-            lines += Firewall.lines_essentials(t["ess"])
-        coupe = bool(t["cut"])
-        if full or coupe != a["cut"]:
-            lines += Firewall.lines_cut(coupe)
-        # la politique en dernier : les autorisations sont deja en place
-        if full or t["lockdown"] != a["lockdown"]:
-            lines += Firewall.line_lockdown(t["lockdown"])
-
-        Firewall.run_script(lines)
-        self.applied = {"engaged": True, "allow": set(t["allow"]),
-                        "block": set(t["block"]), "cut": coupe, "ess": t["ess"],
-                        "lockdown": t["lockdown"]}
-        if t["cut"] == "enveloppe":
-            return ("Enveloppe epuisee : Internet coupe jusqu'a la remise a zero "
-                    "(localhost et reseau local restent ouverts)")
-        if t["cut"] == "plage":
-            suite = self.state_mgr.schedule_next_change()
-            return ("Hors plage horaire : Internet coupe" +
-                    (" jusqu'a %s" % suite[1] if suite else ""))
-        if t["libre"]:
-            return "Profil %s : aucun filtrage, le compteur tourne" % t["nom"]
-        if not lines:
-            return ("Protection active - %d programmes autorises, %d bloques"
-                    % (len(t["allow"]), len(t["block"])))
-        return ("Regles a jour en %.1f s : %d programmes autorises, %d bloques"
-                % (time.time() - debut, len(t["allow"]), len(t["block"])))
+        self.backend.restore(self._all_known_paths())
 
     def toggle_engage(self):
         d = self.state_mgr.data
@@ -3249,8 +3884,8 @@ class NetGateApp(tk.Tk):
 
         tk.Label(frm, bg=C_PANEL, fg=C_WARN, justify="left", wraplength=430,
                  font=("Segoe UI", 8),
-                 text=("La protection sera desactivee et les regles NETGATE_ du "
-                       "pare-feu supprimees des que les autorisations sont effacees : "
+                 text=("La protection sera desactivee et les filtres de NetGate "
+                       "retires des que les autorisations sont effacees : "
                        "Internet redevient normal, tu pourras reactiver ensuite.")
                  ).pack(anchor="w", pady=(4, 12))
 
@@ -3568,12 +4203,16 @@ class NetGateApp(tk.Tk):
         v_to = tk.StringVar(value=str(d["notify_timeout"]))
         v_min = tk.BooleanVar(value=d["start_minimized"])
         v_cut = tk.BooleanVar(value=d.get("quota_cut", True))
+        moteurs = {"NetGate (WFP)": "wfp", "Pare-feu Windows": "netsh"}
+        v_moteur = tk.StringVar(value=[k for k, v in moteurs.items()
+                                       if v == d.get("engine", "wfp")][0])
 
         rows = [
             ("Enveloppe du jour (Mo)", v_quota, None),
             ("Heure de remise a zero (HH:MM)", v_reset, None),
             ("Heure de reference", v_tz, ["local", "utc"]),
             ("Duree d'affichage des notifications (s)", v_to, None),
+            ("Moteur de filtrage", v_moteur, list(moteurs)),
         ]
         r = 0
         for label, var, values in rows:
@@ -3586,6 +4225,14 @@ class NetGateApp(tk.Tk):
                 ttk.Entry(frm, textvariable=var, width=16).grid(row=r, column=1,
                                                                 sticky="w", padx=12)
             r += 1
+
+        en_service = "en service : " + self.backend.nom
+        if self._backend_note:
+            en_service += " (%s)" % self._court(self._backend_note, 70)
+        tk.Label(frm, bg=C_PANEL, fg=C_TXT_DIM, justify="left", wraplength=430,
+                 font=("Segoe UI", 8), text=en_service
+                 ).grid(row=r, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        r += 1
 
         for label, var in (("Couper Internet quand l'enveloppe est epuisee", v_cut),
                            ("Autoriser DNS/DHCP (indispensable en mode protege)", v_dns),
@@ -3677,8 +4324,9 @@ class NetGateApp(tk.Tk):
         tk.Label(frm, bg=C_PANEL, fg=C_TXT_DIM, justify="left", wraplength=430,
                  font=("Segoe UI", 8),
                  text=("Un seul fichier : profils, autorisations, compteurs et "
-                       "historique. Aucune ecriture ailleurs. Les regles du pare-feu "
-                       "Windows portent le prefixe NETGATE_.")
+                       "historique. Aucune ecriture ailleurs. Les filtres de NetGate "
+                       "disparaissent avec lui ; ceux du moteur de repli (pare-feu "
+                       "Windows) portent le prefixe NETGATE_.")
                  ).grid(row=r, column=0, columnspan=2, sticky="w", pady=(3, 0))
         r += 1
         zone = tk.Frame(frm, bg=C_PANEL)
@@ -3702,11 +4350,15 @@ class NetGateApp(tk.Tk):
             d["start_minimized"] = bool(v_min.get())
             d["quota_cut"] = bool(v_cut.get())
             d["essentials_dns"] = bool(v_dns.get())
+            ancien_moteur = d.get("engine", "wfp")
+            d["engine"] = moteurs.get(v_moteur.get(), "wfp")
             self.state_mgr.roll_period_if_needed()
             self.state_mgr.save()
             self._icon_sig = None
             self._check_cut()
-            if d["engaged"]:
+            if d["engine"] != ancien_moteur:
+                self._switch_backend()      # l'ancien moteur retire tout
+            elif d["engaged"]:
                 self.apply_firewall()       # DNS/DHCP, coupure : seul ce qui change
             self.refresh_all()
             self.refresh_window_icon()
@@ -3867,6 +4519,8 @@ class NetGateApp(tk.Tk):
         local = d["usage"].get("local", 0)
         if local:
             lignes.append("localhost et reseau local ecartes : %s" % fmt_bytes(local))
+        repli = d.get("engine", "wfp") == "wfp" and not isinstance(self.backend, WfpBackend)
+        lignes.insert(0, "filtrage : %s%s" % (self.backend.nom, " (repli)" if repli else ""))
         self.lbl_engine.configure(text="\n".join(lignes), justify="right")
 
     def refresh_profiles(self):
@@ -4075,6 +4729,11 @@ class NetGateApp(tk.Tk):
         dt = max(0.5, now - self._last_tick)
         self._last_tick = now
         etw = self.meter.drain()
+        # connexions refusees par le pare-feu : une demande, facon ZoneAlarm,
+        # meme pour un programme qui n'a encore jamais reussi a sortir
+        if psutil is not None:
+            for pid in etw.get("bloques", {}):
+                self.scanner.signal_blocked(pid)
 
         tick = {}
         for pid, (s, r) in etw["apps"].items():
@@ -4183,9 +4842,206 @@ class NetGateApp(tk.Tk):
                 msg += "  (periode precedente : %s)" % fmt_bytes(volume)
             self.status(msg)
             log_line(msg)
+        log_line("moteur de filtrage : %s%s" % (
+            self.backend.nom, (" (%s)" % self._backend_note) if self._backend_note else ""))
+        try:
+            self._legacy_cleanup()
+        except Exception:
+            log_error("nettoyage des regles d'une session precedente")
         if self.state_mgr.data.get("engaged"):
             self.apply_firewall(full=True)
         self.refresh_all()
+
+
+# ==========================================================================
+#  AUTOTEST DU MOTEUR (python netgate.py --test-wfp)
+# ==========================================================================
+
+TEST_ADRESSE = ("192.0.2.1", 9)     # TEST-NET-1 : reservee a la documentation
+
+
+def essai_connexion(adresse, delai=1.5):
+    """'refuse' si le pare-feu refuse la connexion (WSAEACCES), sinon ce qui
+    s'est passe ; vers TEST_ADRESSE, sans filtre, rien ne repond."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(delai)
+    try:
+        s.connect(adresse)
+        return "connecte"
+    except OSError as e:
+        if getattr(e, "winerror", None) == 10013:
+            return "refuse"
+        return "pas de reponse" if isinstance(e, socket.timeout) else "echec (%s)" % e
+    finally:
+        s.close()
+
+
+def selftest_wfp():
+    """Verifie sur ce PC que le moteur NetGate fonctionne, sans rien risquer :
+    chaque filtre de test ne vise que ce programme-ci, vers une adresse de
+    documentation qui n'existe pas sur Internet ou vers localhost, dans une
+    session dynamique qui disparait a la fin. Les autres programmes ne voient
+    rien. Rapport dans netgate-test-wfp.txt, a cote du programme."""
+    lignes = []
+    bilan = {"ok": True}
+
+    def note(etat, texte):
+        ligne = ("%-10s %s" % (etat, texte)).rstrip()
+        lignes.append(ligne)
+        print(ligne)
+
+    def exige(cond, texte):
+        note("OK" if cond else "ECHEC", texte)
+        if not cond:
+            bilan["ok"] = False
+        return cond
+
+    def fin():
+        note("", "")
+        if bilan["ok"]:
+            note("RESULTAT", "le moteur NetGate (WFP) fonctionne sur ce PC")
+        else:
+            note("RESULTAT", "moteur NetGate NON utilisable ici : Reglages > Moteur "
+                             "de filtrage > Pare-feu Windows")
+        chemin = os.path.join(STATE_DIR, "netgate-test-wfp.txt")
+        try:
+            with open(chemin, "w", encoding="utf-8") as f:
+                f.write("\n".join(lignes) + "\n")
+        except Exception:
+            chemin = "(rapport non enregistre)"
+        log_line("autotest WFP : %s" % ("reussi" if bilan["ok"] else "echec"))
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            (messagebox.showinfo if bilan["ok"] else messagebox.showwarning)(
+                "%s - autotest du moteur" % APP_NAME,
+                "\n".join(lignes) + "\n\nRapport : %s" % chemin)
+            root.destroy()
+        except Exception:
+            pass
+        return bilan["ok"]
+
+    note("INFO", "%s %s - autotest du moteur de filtrage (WFP)" % (APP_NAME, VERSION_TXT))
+    note("INFO", "Windows %d.%d.%d, Python %s, administrateur : %s"
+         % (sys.getwindowsversion()[:3] + (sys.version.split()[0], is_admin())))
+    if not exige(is_admin(), "droits administrateur"):
+        return fin()
+
+    eng = WfpEngine()
+    try:
+        eng.open()
+        note("OK", "session dynamique ouverte, sous-couche NetGate creee")
+    except Exception as e:
+        exige(False, "ouverture du moteur : %s" % e)
+        return fin()
+    moi = eng.app_id(sys.executable)
+    if not exige(moi is not None, "identifiant WFP de ce programme"):
+        eng.close()
+        return fin()
+    cond_moi = (WFP_COND_APP_ID, FWP_MATCH_EQUAL, FWP_BYTE_BLOB_TYPE, moi)
+
+    def vers(adresse):
+        return (WFP_COND_REMOTE_ADDRESS, FWP_MATCH_EQUAL, FWP_V4_ADDR_MASK,
+                v4_mask(adresse, 32))
+
+    r = essai_connexion(TEST_ADRESSE)
+    exige(r != "refuse", "sans filtre, la connexion de test n'est pas refusee (%s)" % r)
+
+    session, vus = None, []
+    if _etw is not None:
+        try:
+            EtwMeter._arreter_session("NetGate-Test")
+            session = _etw.ETW(
+                session_name="NetGate-Test", event_id_filters=[TCPIP_CONNECT_BLOCKED],
+                providers=[_etw.ProviderInfo("Microsoft-Windows-TCPIP", _GUID(TCPIP_GUID),
+                                             level=2, any_keywords=TCPIP_KW_CONNECTPATH)],
+                event_callback=lambda ev: vus.append(ev))
+            session.start()
+            time.sleep(1.0)
+        except Exception as e:
+            note("ATTENTION", "session ETW de test impossible : %s" % e)
+            session = None
+
+    try:
+        eng.add_filter("C4", 1, FWP_ACTION_BLOCK, [cond_moi, vers(TEST_ADRESSE[0])],
+                       "NetGate test - blocage")
+        r = essai_connexion(TEST_ADRESSE)
+        exige(r == "refuse", "un filtre de blocage refuse la connexion (%s)" % r)
+
+        if session is not None:
+            fin_attente = time.time() + 5
+            moi_pid = os.getpid()
+            while time.time() < fin_attente and not any(
+                    EtwMeter._pick(ev[1], ("ProcessId", "PID")) == moi_pid
+                    for ev in list(vus) if isinstance(ev[1], dict)):
+                time.sleep(0.2)
+            vu = any(EtwMeter._pick(ev[1], ("ProcessId", "PID")) == moi_pid
+                     for ev in list(vus) if isinstance(ev[1], dict))
+            note("OK" if vu else "ATTENTION",
+                 "la tentative bloquee est visible (evenement TCPIP 1020)" if vu else
+                 "tentative bloquee invisible : pas de carte de demande pour un "
+                 "programme bloque, le reste fonctionne")
+            try:
+                session.stop()
+            except Exception:
+                pass
+
+        f_ok = eng.add_filter("C4", 10, FWP_ACTION_PERMIT, [cond_moi, vers(TEST_ADRESSE[0])],
+                              "NetGate test - autorisation")
+        r = essai_connexion(TEST_ADRESSE)
+        exige(r != "refuse", "une autorisation passe devant le blocage (%s)" % r)
+        eng.delete_filter(f_ok)
+        r = essai_connexion(TEST_ADRESSE)
+        exige(r == "refuse", "autorisation retiree : le blocage reprend (%s)" % r)
+
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        srv.settimeout(3)
+        eng.add_filter("C4", 1, FWP_ACTION_BLOCK, [cond_moi, vers("127.0.0.1")],
+                       "NetGate test - blocage localhost")
+        f_lo = eng.add_filter("C4", 15, FWP_ACTION_PERMIT,
+                              [cond_moi, (WFP_COND_FLAGS, FWP_MATCH_FLAGS_ALL_SET, FWP_UINT32,
+                                          FWP_CONDITION_FLAG_IS_LOOPBACK)],
+                              "NetGate test - localhost")
+        cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        cli.settimeout(2)
+        try:
+            cli.connect(srv.getsockname())
+            r = "connecte"
+        except OSError as e:
+            r = "refuse" if getattr(e, "winerror", None) == 10013 else "echec (%s)" % e
+        exige(r == "connecte", "localhost reste ouvert malgre un blocage (%s)" % r)
+
+        if r == "connecte":
+            # une connexion deja etablie est-elle coupee quand les filtres
+            # changent ? C'est ce qui arrete un telechargement en cours.
+            conn, _ = srv.accept()
+            conn.settimeout(2.5)
+            eng.delete_filter(f_lo)
+            try:
+                cli.sendall(b"netgate")
+            except OSError:
+                pass
+            try:
+                coupe = not conn.recv(16)
+            except OSError:
+                coupe = True
+            note("OK" if coupe else "ATTENTION",
+                 "une connexion deja ouverte est coupee par un nouveau blocage" if coupe
+                 else "une connexion deja ouverte n'est pas coupee par un nouveau "
+                      "blocage (un telechargement en cours pourrait finir)")
+            conn.close()
+        cli.close()
+        srv.close()
+    except Exception as e:
+        exige(False, "erreur pendant le test : %s" % e)
+    finally:
+        eng.close()
+
+    r = essai_connexion(TEST_ADRESSE)
+    exige(r != "refuse", "session fermee : les filtres ont disparu d'eux-memes (%s)" % r)
+    return fin()
 
 
 # ==========================================================================
@@ -4197,6 +5053,19 @@ def main():
         print("NetGate fonctionne uniquement sous Windows.")
         return 1
 
+    if "--test-wfp" in sys.argv:
+        if not is_admin():
+            root = tk.Tk()
+            root.withdraw()
+            go = messagebox.askyesno(
+                APP_NAME, "L'autotest du moteur de filtrage demande les droits "
+                          "administrateur.\n\nRelancer en administrateur ?")
+            root.destroy()
+            if go:
+                relaunch_as_admin()
+            return 0
+        return 0 if selftest_wfp() else 1
+
     log_line("--- demarrage %s | python %s | admin=%s | psutil=%s | pywintrace=%s | "
              "pystray=%s | pillow=%s"
              % (VERSION_TXT, sys.version.split()[0], is_admin(), psutil is not None,
@@ -4207,8 +5076,8 @@ def main():
         root.withdraw()
         go = messagebox.askyesno(
             APP_NAME,
-            "NetGate a besoin des droits administrateur pour piloter le pare-feu "
-            "Windows.\n\nOUI : relancer en administrateur.\n"
+            "NetGate a besoin des droits administrateur pour filtrer les "
+            "connexions.\n\nOUI : relancer en administrateur.\n"
             "NON : ouvrir quand meme en mode limite (l'interface et les compteurs "
             "fonctionnent, le blocage non).")
         root.destroy()
