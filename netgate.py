@@ -19,8 +19,8 @@
 NetGate - Controle d'acces Internet par application (Windows)
 =============================================================
 Principe : le robinet Internet est ferme, tu l'ouvres application par
-application. NetGate compte ce que chacune consomme et te previent quand
-l'enveloppe du jour s'epuise, sans jamais rien couper de lui-meme.
+application. NetGate compte ce que chacune consomme, te previent quand
+l'enveloppe du jour s'epuise et coupe Internet quand elle est vide.
 
 L'application vit dans la zone de notification (a cote de l'horloge). Des
 qu'un programme essaie d'aller sur Internet, une petite fenetre apparait en
@@ -46,10 +46,19 @@ V1.2  L'enveloppe n'est decomptee que lorsque la protection est active ;
       remise a zero au demarrage. Bascule forcee si l'horloge a recule.
 V1.3  Plages horaires : tableau de 48 demi-heures dans les reglages, hors
       plage plus aucun programme ne sort.
+V1.4  Coupure reelle a 100 % de l'enveloppe (case dans les reglages) avec
+      rallonge du jour. Coupures et blocages passent par des regles de
+      blocage, qui l'emportent sur les regles d'autorisation que Windows et
+      les logiciels installes ont deja posees. Enveloppe mesuree sur la carte
+      reseau physique ; localhost, reseau local et tunnels VPN ne sont plus
+      decomptes. Un programme mis a jour (dossier portant un numero de
+      version) garde sa decision au lieu de reapparaitre en double.
 """
 
 import ctypes
+import glob
 import hashlib
+import ipaddress
 import json
 import os
 import queue
@@ -109,7 +118,7 @@ ANNEE = "2026"
 # Numerotation : V<majeure>.<mineure>, plus une lettre pour une retouche
 # mineure (V1.1a). La majeure change en cas de refonte, la mineure a chaque
 # ajout ou correction, la lettre pour un ajustement cosmetique.
-VERSION = "1.3"
+VERSION = "1.4"
 
 VERSION_TXT = "V" + VERSION
 COPYRIGHT = "%s \u00a9 %s" % (AUTEUR, ANNEE)
@@ -124,6 +133,22 @@ CREATE_NO_WINDOW = 0x08000000
 KERNEL_NETWORK_GUID = "{7DD42A49-5329-4832-8DFD-43D979153A88}"
 ETW_SENT_IDS = {10, 26, 42, 58}
 ETW_RECV_IDS = {11, 27, 43, 59}
+# Nom fixe : apres un arret brutal, la session ETW restee ouverte est reprise
+# au lieu d'en ouvrir une nouvelle a chaque lancement.
+ETW_SESSION = "NetGate-Reseau"
+
+# Adresses publiques, c'est-a-dire tout sauf localhost, reseaux prives,
+# liaison locale et multidiffusion. Les regles de blocage ne visent qu'elles :
+# couper Internet ne coupe ni les serveurs locaux ni le reseau de la maison.
+# 64:ff9b:: : Internet IPv4 vu depuis un reseau mobile tout IPv6 (NAT64).
+INTERNET_IPS = ("1.0.0.0-9.255.255.255,11.0.0.0-126.255.255.255,"
+                "128.0.0.0-169.253.255.255,169.255.0.0-172.15.255.255,"
+                "172.32.0.0-192.167.255.255,192.169.0.0-223.255.255.255,"
+                "2000::/3,64:ff9b::/96,64:ff9b:1::/48")
+
+# Cle regroupant le trafic dont le programme n'a pas pu etre identifie
+# (processus deja termine au moment du releve).
+UNATTRIBUTED = "(non attribue)"
 
 C_BG      = "#16181d"
 C_PANEL   = "#1e2128"
@@ -222,9 +247,20 @@ def slugify(name):
     s = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
     return s or ("profil-%d" % int(time.time()))
 
+
+def empty_usage(period=""):
+    """Compteurs d'une periode. total_* entame l'enveloppe, off_* est mesure
+    hors protection, bonus est la rallonge accordee pour la periode, local
+    le trafic localhost et reseau local ecarte du compte."""
+    return {"period": period, "per_app": {}, "per_profile": {}, "per_hour": {},
+            "total_sent": 0, "total_recv": 0, "off_sent": 0, "off_recv": 0,
+            "bonus": 0, "local": 0}
+
+
 DEFAULT_STATE = {
-    "schema": 2,
+    "schema": 3,
     "quota_mb": 500,
+    "quota_cut": True,             # couper Internet a 100 % de l'enveloppe
     "reset_hh": 0,
     "reset_mm": 0,
     "tz_mode": "local",
@@ -235,11 +271,12 @@ DEFAULT_STATE = {
     "notify_enabled": True,
     "notify_timeout": 25,
     "start_minimized": False,
-    "active_profile": "essentiel",
+    "nic_exclude": [],             # cartes physiques que l'utilisateur ne compte pas
+    "nic_include": [],             # cartes virtuelles qu'il compte quand meme
+    "active_profile": "defaut",
     "profiles": DEFAULT_PROFILES,
     "catalog": {},
-    "usage": {"period": "", "per_app": {}, "per_profile": {}, "per_hour": {},
-              "total_sent": 0, "total_recv": 0, "off_sent": 0, "off_recv": 0},
+    "usage": empty_usage(),
     "history": {},
     "alerts_fired": [],
     "engaged": False,
@@ -288,9 +325,72 @@ def proc_connections(proc, kind="inet"):
     return fn(kind=kind)
 
 
-def rule_name_for(path):
+def rule_name_for(path, kind="OUT"):
+    """OUT : autorisation du programme ; BLK : blocage vers Internet."""
     h = hashlib.sha1(path.lower().encode("utf-8", "ignore")).hexdigest()[:14]
-    return RULE_PREFIX + "OUT_" + h
+    return RULE_PREFIX + kind + "_" + h
+
+
+# Dossiers qui changent de nom a chaque mise a jour :
+#   152.0.4191.66, 4.18.26080.3-0, app-1.0.9187, jre1.8.0_381 ...
+_RE_DOSSIER_VERSION = re.compile(r"^([a-z]{0,4}-?)\d+(?:\.\d+){1,4}(?:[-_+][0-9a-z]+)*$")
+#   paquets du Store : claude_2.110.0.0_x64__pzs8sxrjxfjjc
+_RE_DOSSIER_PAQUET = re.compile(r"^(.+?)_\d+(?:\.\d+){1,3}_([a-z0-9]+)_([^_]*)_([a-z0-9]{13})$")
+#   pilotes : lenovofnandfunctionkeys.inf_amd64_5e21bf389d23855a
+_RE_DOSSIER_PILOTE = re.compile(r"^(.+\.inf)_([a-z0-9]+)_[0-9a-f]{16}$")
+
+
+def app_key(path):
+    """Identite stable d'un programme : le chemin en minuscules, ou les
+    dossiers portant un numero de version sont remplaces par '*'. Ainsi une
+    mise a jour (claude_2.110 -> claude_2.111) garde la meme ligne et la
+    meme decision au lieu d'apparaitre en double. La cle reste un motif glob
+    valide pour retrouver les versions installees."""
+    p = (path or "").strip().lower()
+    if not p or p.startswith("(") or "\\" not in p:
+        return p
+    parts = p.split("\\")
+    for i in range(1, len(parts) - 1):          # ni le lecteur, ni le .exe
+        seg = parts[i]
+        m = _RE_DOSSIER_PAQUET.match(seg)
+        if m:
+            parts[i] = "%s_*_%s_%s_%s" % m.groups()
+            continue
+        m = _RE_DOSSIER_PILOTE.match(seg)
+        if m:
+            parts[i] = "%s_%s_*" % m.groups()
+            continue
+        m = _RE_DOSSIER_VERSION.match(seg)
+        if m:
+            parts[i] = m.group(1) + "*"
+    return "\\".join(parts)
+
+
+_NETS_LOCAUX = [ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.168.0.0/16", "224.0.0.0/3",            # multidiffusion, reserve, diffusion
+    "::/128", "::1/128", "fe80::/10", "fc00::/7", "ff00::/8")]
+
+
+def addr_scope(ip, own=frozenset(), prefixes=frozenset()):
+    """'self' : cette machine (localhost ou une de ses propres adresses) ;
+    'lan' : reseau local (prive, liaison locale, multidiffusion, ou meme
+    prefixe IPv6 /64 qu'une adresse de la machine) ; 'internet' : le reste.
+    Une adresse illisible compte comme Internet : mieux vaut decompter un
+    octet de trop qu'en oublier un."""
+    try:
+        a = ipaddress.ip_address(str(ip).split("%")[0].strip())
+    except ValueError:
+        return "internet"
+    if a.version == 6 and a.ipv4_mapped:
+        a = a.ipv4_mapped
+    if a.is_loopback or str(a) in own:
+        return "self"
+    if any(a in n for n in _NETS_LOCAUX if n.version == a.version):
+        return "lan"
+    if a.version == 6 and (int(a) >> 64) in prefixes:
+        return "lan"
+    return "internet"
 
 
 def now_in(tz_mode):
@@ -311,6 +411,8 @@ class Firewall:
 
     ESS_NAMES = (RULE_PREFIX + "ESS_DNS_UDP", RULE_PREFIX + "ESS_DNS_TCP",
                  RULE_PREFIX + "ESS_DHCP")
+    CUT_NAME = RULE_PREFIX + "CUT"
+    _echec_signale = False
 
     # ------------------------------------------------- fabrication des lignes
     @staticmethod
@@ -322,8 +424,37 @@ class Firewall:
                 % (name, path, (label or os.path.basename(path))[:60])]
 
     @staticmethod
-    def line_delete(path):
-        return ['advfirewall firewall delete rule name=%s' % rule_name_for(path)]
+    def line_block(path, label=""):
+        """Bloque le programme vers Internet. Dans le pare-feu Windows, une
+        regle de blocage l'emporte sur toutes les regles d'autorisation, y
+        compris celles que Windows ou l'installateur du logiciel ont posees
+        de leur cote : sans elle, "Bloquer" ne suffit pas pour ces
+        programmes-la. Localhost et reseau local restent ouverts."""
+        name = rule_name_for(path, "BLK")
+        return ['advfirewall firewall delete rule name=%s' % name,
+                'advfirewall firewall add rule name=%s dir=out action=block '
+                'program="%s" remoteip=%s enable=yes profile=any '
+                'description="NetGate bloque %s"'
+                % (name, path, INTERNET_IPS, (label or os.path.basename(path))[:60])]
+
+    @staticmethod
+    def line_delete(path, kinds=("OUT", "BLK")):
+        return ['advfirewall firewall delete rule name=%s' % rule_name_for(path, k)
+                for k in kinds]
+
+    @staticmethod
+    def lines_cut(enable):
+        """Coupure generale (enveloppe epuisee, hors plage horaire) : une seule
+        regle de blocage vers toutes les adresses publiques. Elle passe devant
+        toutes les autorisations, celles de NetGate comme celles deja posees
+        dans Windows ; localhost et reseau local restent ouverts."""
+        lines = ['advfirewall firewall delete rule name=%s' % Firewall.CUT_NAME]
+        if enable:
+            lines.append('advfirewall firewall add rule name=%s dir=out action=block '
+                         'remoteip=%s enable=yes profile=any '
+                         'description="NetGate : Internet coupe"'
+                         % (Firewall.CUT_NAME, INTERNET_IPS))
+        return lines
 
     @staticmethod
     def line_lockdown(enable):
@@ -350,33 +481,53 @@ class Firewall:
     # ------------------------------------------------------------- execution
     @staticmethod
     def run_script(lines):
-        """Execute toutes les commandes en un seul processus netsh."""
+        """Execute toutes les commandes en un seul processus netsh.
+
+        netsh -f execute toutes les lignes meme si l'une echoue, et renvoie 1
+        des qu'une ligne echoue : c'est le cas normal d'une suppression de
+        regle absente. Un code 1 ne justifie donc pas de rejouer le script."""
         lines = [l for l in lines if l]
         if not lines:
             return True
-        fichier = os.path.join(tempfile.gettempdir(),
-                               "netgate_%d_%d.netsh" % (os.getpid(), int(time.time() * 1000)))
-        try:
-            # netsh lit ses scripts dans l'encodage local de la machine
-            with open(fichier, "w", encoding="mbcs", errors="replace") as f:
-                f.write("\n".join(lines) + "\n")
-        except Exception:
-            return Firewall._run_one_by_one(lines)
-        rc, out = run_netsh(["-f", fichier], timeout=90)
-        try:
-            os.remove(fichier)
-        except Exception:
-            pass
-        if rc != 0:
-            log_line("netsh -f a echoue (%s), repli commande par commande" % rc)
-            return Firewall._run_one_by_one(lines)
-        return True
+        # netsh lit ses scripts dans l'encodage local de la machine : une
+        # ligne qui ne s'y ecrit pas (chemin en cyrillique, par exemple) est
+        # executee a part, en argument Unicode.
+        script, a_part = [], []
+        for l in lines:
+            try:
+                l.encode("mbcs")
+                script.append(l)
+            except (UnicodeEncodeError, LookupError):
+                a_part.append(l)
+        ok = True
+        if script:
+            fichier = os.path.join(tempfile.gettempdir(), "netgate_%d_%d.netsh"
+                                   % (os.getpid(), int(time.time() * 1000)))
+            try:
+                with open(fichier, "w", encoding="mbcs") as f:
+                    f.write("\n".join(script) + "\n")
+                rc, out = run_netsh(["-f", fichier], timeout=120)
+                if rc != 0 and not Firewall._echec_signale:
+                    Firewall._echec_signale = True
+                    log_line("netsh -f : au moins une ligne a echoue (normal pour la "
+                             "suppression d'une regle absente) :\n" + out[:600])
+            except Exception:
+                log_error("script netsh")
+                ok = Firewall._run_one_by_one(script)
+            finally:
+                try:
+                    os.remove(fichier)
+                except Exception:
+                    pass
+        if a_part:
+            ok = Firewall._run_one_by_one(a_part) and ok
+        return ok
 
     @staticmethod
     def _run_one_by_one(lines):
-        """Repli si le script echoue : chemin non representable en encodage
-        local, par exemple. Les valeurs entre guillemets (chemins avec
-        espaces) doivent rester solidaires de leur mot-cle."""
+        """Une commande par processus netsh, pour les lignes que le script ne
+        peut pas porter. Les valeurs entre guillemets (chemins avec espaces)
+        doivent rester solidaires de leur mot-cle."""
         ok = True
         for l in lines:
             args = []
@@ -404,16 +555,11 @@ class Firewall:
         return Firewall.run_script(Firewall.lines_essentials(enable)), ""
 
     @staticmethod
-    def purge(paths):
-        lines = []
-        for p in paths:
-            lines += Firewall.line_delete(p)
-        lines += Firewall.lines_essentials(False)
-        return Firewall.run_script(lines)
-
-    @staticmethod
     def panic_restore(paths):
+        """Politique sortante d'origine, coupure levee, et plus aucune regle
+        NETGATE_ pour les programmes connus."""
         lines = list(Firewall.line_lockdown(False))
+        lines += Firewall.lines_cut(False)
         for p in paths:
             lines += Firewall.line_delete(p)
         lines += Firewall.lines_essentials(False)
@@ -425,31 +571,63 @@ class Firewall:
 # ==========================================================================
 
 class EtwMeter(threading.Thread):
+    """Attribue a chaque processus les octets qu'il echange avec Internet.
+
+    Chaque evenement du fournisseur Kernel-Network porte les deux adresses de
+    la connexion. Le trafic de la machine avec elle-meme (localhost : WAMP,
+    MySQL, PHP...) et avec le reseau local ne consomme pas le forfait : il
+    est mis de cote au lieu d'etre impute aux programmes."""
     daemon = True
 
     def __init__(self):
         super().__init__(name="EtwMeter")
         self._stop = threading.Event()
         self._lock = threading.Lock()
-        self._acc = {}
+        self._reset_acc()
         self.mode = "init"
         self.error = ""
         self._job = None
-        self._fb_base = None
+        self._scopes = {}
+        self.own = frozenset(("127.0.0.1", "::1"))
+        self.counted = frozenset()
+        self.prefixes = frozenset()
+
+    def _reset_acc(self):
+        self._acc = {}              # pid -> [envoye, recu] avec Internet
+        self._inet = [0, 0]         # tout le trafic Internet, toutes cartes
+        self._lan = [0, 0]          # reseau local passe par une carte decomptee
+        self._local = 0             # localhost + reseau local, pour information
+
+    def set_addresses(self, own, counted, prefixes):
+        """Adresses de la machine, adresses des cartes decomptees, prefixes
+        IPv6 /64 de la machine. Mis a jour depuis l'interface."""
+        self.own, self.counted, self.prefixes = own, counted, prefixes
+        self._scopes = {}
 
     def drain(self):
         with self._lock:
-            data, self._acc = self._acc, {}
-        return data
+            out = {"apps": self._acc, "inet": self._inet, "lan": self._lan,
+                   "local": self._local}
+            self._reset_acc()
+        return out
 
     def stop(self):
         self._stop.set()
 
-    def _add(self, pid, sent, recv):
-        with self._lock:
-            slot = self._acc.setdefault(pid, [0, 0])
-            slot[0] += sent
-            slot[1] += recv
+    def _scope(self, ip):
+        """(portee, adresse normalisee), avec cache : le rappel ETW tourne a
+        chaque paquet."""
+        r = self._scopes.get(ip)
+        if r is None:
+            try:
+                canon = str(ipaddress.ip_address(str(ip).split("%")[0].strip()))
+            except ValueError:
+                canon = str(ip)
+            r = (addr_scope(ip, self.own, self.prefixes), canon)
+            if len(self._scopes) > 5000:
+                self._scopes = {}
+            self._scopes[ip] = r
+        return r
 
     @staticmethod
     def _pick(payload, keys):
@@ -472,57 +650,179 @@ class EtwMeter(threading.Thread):
             return
         if not isinstance(payload, dict):
             return
-        if event_id not in ETW_SENT_IDS and event_id not in ETW_RECV_IDS:
+        sens = 0 if event_id in ETW_SENT_IDS else 1
+        if sens == 1 and event_id not in ETW_RECV_IDS:
             return
         pid = self._pick(payload, ("PID", "pid", "ProcessId"))
         size = self._pick(payload, ("size", "Size", "TransferSize", "DataLength"))
         if pid is None or not size or size <= 0:
             return
-        if event_id in ETW_SENT_IDS:
-            self._add(pid, size, 0)
-        else:
-            self._add(pid, 0, size)
+        a, b = payload.get("saddr"), payload.get("daddr")
+        sa, ca = self._scope(a) if a else ("internet", "")
+        sb, cb = self._scope(b) if b else ("internet", "")
+        with self._lock:
+            if sa == "internet" or sb == "internet":
+                slot = self._acc.setdefault(pid, [0, 0])
+                slot[sens] += size
+                self._inet[sens] += size
+                return
+            self._local += size
+            # reseau local passe par une carte decomptee : la carte l'a vu
+            # passer, il faudra le retirer de son compteur
+            if sa != sb and (ca if sa == "self" else cb) in self.counted:
+                self._lan[sens] += size
 
     def run(self):
-        if _etw is not None and _GUID is not None:
-            try:
-                providers = [_etw.ProviderInfo("Microsoft-Windows-Kernel-Network",
-                                               _GUID(KERNEL_NETWORK_GUID))]
-                self._job = _etw.ETW(providers=providers, event_callback=self._callback)
-                self._job.start()
-                self.mode = "etw"
-            except Exception as e:
-                self.mode = "global"
-                self.error = str(e)
-        else:
-            self.mode = "global"
-            self.error = "pywintrace absent"
-        while not self._stop.is_set():
-            if self.mode == "global":
-                self._fb_tick()
-            time.sleep(1.0)
-        if self._job is not None:
-            try:
-                self._job.stop()
-            except Exception:
-                pass
-
-    def _fb_tick(self):
-        if psutil is None:
+        if _etw is None or _GUID is None:
+            self.mode, self.error = "off", "pywintrace absent"
             return
         try:
-            c = psutil.net_io_counters()
+            providers = [_etw.ProviderInfo("Microsoft-Windows-Kernel-Network",
+                                           _GUID(KERNEL_NETWORK_GUID))]
+            try:
+                # les evenements hors envoi/reception ne sont meme pas decodes
+                self._job = _etw.ETW(session_name=ETW_SESSION, providers=providers,
+                                     event_callback=self._callback,
+                                     event_id_filters=sorted(ETW_SENT_IDS | ETW_RECV_IDS))
+            except TypeError:       # pywintrace trop ancien pour ces options
+                self._job = _etw.ETW(providers=providers, event_callback=self._callback)
+            self._job.start()
+            self.mode = "etw"
+        except Exception as e:
+            self.mode, self.error = "off", str(e)
+            log_line("comptage par programme indisponible : %s" % e)
+            return
+        self._stop.wait()
+        try:
+            self._job.stop()
         except Exception:
-            return
-        cur = (c.bytes_sent, c.bytes_recv)
-        if self._fb_base is None:
-            self._fb_base = cur
-            return
-        ds = max(0, cur[0] - self._fb_base[0])
-        dr = max(0, cur[1] - self._fb_base[1])
-        self._fb_base = cur
-        if ds or dr:
-            self._add(0, ds, dr)
+            pass
+
+
+# ==========================================================================
+#  COMPTEUR DES CARTES RESEAU
+# ==========================================================================
+
+class _GuidStruct(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+    def __str__(self):
+        d4 = bytes(self.Data4)
+        return "{%08X-%04X-%04X-%s-%s}" % (self.Data1, self.Data2, self.Data3,
+                                           d4[:2].hex().upper(), d4[2:].hex().upper())
+
+
+class _MibIfRow2(ctypes.Structure):
+    """MIB_IF_ROW2 (netioapi.h), 1352 octets en 64 bits."""
+    _fields_ = [
+        ("InterfaceLuid", ctypes.c_uint64), ("InterfaceIndex", ctypes.c_ulong),
+        ("InterfaceGuid", _GuidStruct),
+        ("Alias", ctypes.c_wchar * 257), ("Description", ctypes.c_wchar * 257),
+        ("PhysicalAddressLength", ctypes.c_ulong),
+        ("PhysicalAddress", ctypes.c_ubyte * 32),
+        ("PermanentPhysicalAddress", ctypes.c_ubyte * 32),
+        ("Mtu", ctypes.c_ulong), ("Type", ctypes.c_ulong),
+        ("TunnelType", ctypes.c_int), ("MediaType", ctypes.c_int),
+        ("PhysicalMediumType", ctypes.c_int), ("AccessType", ctypes.c_int),
+        ("DirectionType", ctypes.c_int),
+        ("Flags", ctypes.c_ubyte),     # bit 0 : materielle, bit 1 : filtre
+        ("OperStatus", ctypes.c_int), ("AdminStatus", ctypes.c_int),
+        ("MediaConnectState", ctypes.c_int), ("NetworkGuid", _GuidStruct),
+        ("ConnectionType", ctypes.c_int),
+        ("TransmitLinkSpeed", ctypes.c_uint64), ("ReceiveLinkSpeed", ctypes.c_uint64),
+        ("InOctets", ctypes.c_uint64), ("InUcastPkts", ctypes.c_uint64),
+        ("InNUcastPkts", ctypes.c_uint64), ("InDiscards", ctypes.c_uint64),
+        ("InErrors", ctypes.c_uint64), ("InUnknownProtos", ctypes.c_uint64),
+        ("InUcastOctets", ctypes.c_uint64), ("InMulticastOctets", ctypes.c_uint64),
+        ("InBroadcastOctets", ctypes.c_uint64), ("OutOctets", ctypes.c_uint64),
+        ("OutUcastPkts", ctypes.c_uint64), ("OutNUcastPkts", ctypes.c_uint64),
+        ("OutDiscards", ctypes.c_uint64), ("OutErrors", ctypes.c_uint64),
+        ("OutUcastOctets", ctypes.c_uint64), ("OutMulticastOctets", ctypes.c_uint64),
+        ("OutBroadcastOctets", ctypes.c_uint64), ("OutQLen", ctypes.c_uint64),
+    ]
+
+
+class NicMeter:
+    """Compteurs d'octets des cartes reseau, ceux du Gestionnaire des taches.
+
+    C'est la mesure la plus proche de celle de l'operateur : tout ce qui
+    passe par la carte, en-tetes compris, trafic des machines virtuelles
+    compris, et rien de ce qui reste dans la machine (localhost). Seules les
+    cartes physiques comptent par defaut : une carte virtuelle (tunnel VPN,
+    VirtualBox, Hyper-V) ne fait que relayer un trafic qui sort ensuite par
+    la carte physique, la compter le decompterait deux fois."""
+
+    MEDIUMS_PHYSIQUES = (8, 10, 12)     # cle 4G (WWAN), Bluetooth, WiMax
+
+    def __init__(self):
+        self._base = {}
+        self.ifaces = []                # dernier releve, pour les reglages
+        self._signale = False
+        try:
+            self._dll = ctypes.WinDLL("iphlpapi")
+            self._dll.GetIfTable2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+            self._dll.GetIfTable2.restype = ctypes.c_ulong
+            self._dll.FreeMibTable.argtypes = [ctypes.c_void_p]
+            self._dll.FreeMibTable.restype = None
+        except Exception:
+            self._dll = None
+
+    @property
+    def available(self):
+        return self._dll is not None
+
+    def read(self):
+        ptr = ctypes.c_void_p()
+        rc = self._dll.GetIfTable2(ctypes.byref(ptr))
+        if rc != 0 or not ptr.value:
+            raise OSError("GetIfTable2 a renvoye %s" % rc)
+        try:
+            n = ctypes.c_ulong.from_address(ptr.value).value
+            rows = (_MibIfRow2 * n).from_address(ptr.value + ctypes.sizeof(ctypes.c_uint64))
+            out = []
+            for r in rows:
+                # les "filtres" (QoS, WFP, Npcap...) recopient les compteurs
+                # de la carte qu'ils surveillent ; 24 = boucle locale
+                if r.Flags & 2 or r.Type == 24:
+                    continue
+                out.append({"guid": str(r.InterfaceGuid), "alias": r.Alias,
+                            "desc": r.Description, "up": r.OperStatus == 1,
+                            "physique": bool(r.Flags & 1)
+                            or r.PhysicalMediumType in self.MEDIUMS_PHYSIQUES
+                            or r.Type in (243, 244),
+                            "tx": r.OutOctets, "rx": r.InOctets})
+            return out
+        finally:
+            self._dll.FreeMibTable(ptr)
+
+    def poll(self, compte):
+        """(envoye, recu) depuis le releve precedent sur les cartes pour
+        lesquelles compte(carte) est vrai, ou None si la lecture echoue. Une
+        carte vue pour la premiere fois sert de point de depart."""
+        if not self._dll:
+            return None
+        try:
+            rows = self.read()
+        except Exception as e:
+            if not self._signale:
+                self._signale = True
+                log_line("lecture des cartes reseau impossible : %s" % e)
+            return None
+        self.ifaces = rows
+        ds = dr = 0
+        base = {}
+        for it in rows:
+            cur = (it["tx"], it["rx"])
+            prev = self._base.get(it["guid"])
+            base[it["guid"]] = cur
+            if prev is None or not compte(it):
+                continue
+            # compteur reparti de zero (carte desactivee puis reactivee)
+            ds += cur[0] - prev[0] if cur[0] >= prev[0] else cur[0]
+            dr += cur[1] - prev[1] if cur[1] >= prev[1] else cur[1]
+        self._base = base
+        return ds, dr
 
 
 # ==========================================================================
@@ -530,59 +830,116 @@ class EtwMeter(threading.Thread):
 # ==========================================================================
 
 class ConnScanner(threading.Thread):
+    """Signale a l'interface chaque executable qui ouvre une connexion vers
+    Internet ("conn"), et chaque executable lance depuis un nouveau dossier
+    de version d'un programme deja tranche ("proc") : apres une mise a jour,
+    la decision doit suivre sans reposer la question. Le tri entre demande
+    et simple mise a jour se fait dans l'interface."""
     daemon = True
 
-    def __init__(self, decided_getter, out_queue, interval=1.5):
+    def __init__(self, out_queue, interval=1.5):
         super().__init__(name="ConnScanner")
         self._stop = threading.Event()
-        self.decided = decided_getter
         self.q = out_queue
         self.interval = interval
         self.pid_cache = {}
-        self.asked = set()
+        self.reported = set()       # chemins deja signales
+        self.watch = frozenset()    # identites tranchees (app_key), tenues a jour par l'interface
+        self._tour = 0
+        self._signale = False
 
     def stop(self):
         self._stop.set()
 
-    def forget(self, path):
-        self.asked.discard(path.lower())
+    def forget(self, key):
+        self.reported = {p for p in self.reported if app_key(p) != key}
 
     def reset_asked(self):
-        self.asked.clear()
+        self.reported = set()
 
     def exe_for(self, pid):
-        if pid in self.pid_cache:
-            return self.pid_cache[pid]
-        exe = None
+        """Chemin de l'executable. Le cache est verifie par l'heure de
+        creation : Windows recycle vite les numeros de processus, et un
+        numero reattribue ne doit pas heriter du nom de l'ancien."""
+        if pid in (0, 4):
+            return "System"
+        ent = self.pid_cache.get(pid)
         try:
-            exe = psutil.Process(pid).exe()
+            proc = psutil.Process(pid)
         except Exception:
+            return ent[0] if ent else None   # termine depuis : le nom connu vaut
+        try:
+            ct = proc.create_time()
+        except Exception:
+            ct = None
+        if ent and (ct is None or ent[1] is None or ent[1] == ct):
+            return ent[0]
+        try:
+            exe = proc.exe() or None
+        except Exception:
+            exe = None
+        if not exe:
             try:
-                exe = psutil.Process(pid).name()
+                nom = proc.name()
             except Exception:
-                exe = None
+                nom = None
+            if nom:
+                # sans droits administrateur, un service (svchost...) ne livre
+                # que son nom : son chemin est presque toujours System32
+                sys32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                     "System32", nom)
+                exe = sys32 if os.path.isfile(sys32) else nom
         if exe:
-            self.pid_cache[pid] = exe
+            self.pid_cache[pid] = (exe, ct)
         return exe
+
+    def _report(self, exe, pid, src):
+        path = exe.lower()
+        if path in self.reported:
+            return
+        self.reported.add(path)
+        self.q.put({"path": exe, "pid": pid, "ts": time.time(), "src": src})
+
+    def _scan_connections(self):
+        pids = set()
+        for c in psutil.net_connections(kind="inet"):
+            if not c.pid or c.status == "LISTEN":
+                continue
+            if c.raddr:
+                # localhost (WAMP, MySQL...) et reseau local ne consomment
+                # pas le forfait : pas de demande pour eux
+                if addr_scope(c.raddr[0]) != "internet":
+                    continue
+            elif c.laddr and addr_scope(c.laddr[0]) == "self":
+                continue
+            pids.add(c.pid)
+        for pid in pids:
+            exe = self.exe_for(pid)
+            if exe:
+                self._report(exe, pid, "conn")
+
+    def _scan_processes(self):
+        watch = self.watch
+        if not watch:
+            return
+        for p in psutil.process_iter(["pid", "exe"]):
+            exe = p.info.get("exe")
+            if exe and exe.lower() not in self.reported and app_key(exe) in watch:
+                self._report(exe, p.info["pid"], "proc")
 
     def run(self):
         if psutil is None:
             return
         while not self._stop.is_set():
             try:
-                conns = psutil.net_connections(kind="inet")
+                self._scan_connections()
+                self._tour += 1
+                if self._tour % 5 == 0:
+                    self._scan_processes()
             except Exception:
-                conns = []
-            pids = {c.pid for c in conns if c.pid and c.status != "LISTEN"}
-            for pid in pids:
-                exe = self.exe_for(pid)
-                if not exe:
-                    continue
-                key = exe.lower()
-                if key in self.decided() or key in self.asked:
-                    continue
-                self.asked.add(key)
-                self.q.put({"path": exe, "pid": pid, "ts": time.time()})
+                if not self._signale:
+                    self._signale = True
+                    log_error("detection des connexions")
             if len(self.pid_cache) > 4000:
                 self.pid_cache.clear()
             self._stop.wait(self.interval)
@@ -625,9 +982,16 @@ class State:
             disk = {}
         # un fichier existant sans numero de schema vient d'avant la
         # simplification : il faut le migrer
-        schema = disk.get("schema", 1) if disk else 2
+        schema = disk.get("schema", 1) if disk else DEFAULT_STATE["schema"]
         if not self.data.get("profiles"):
             self.data["profiles"] = json.loads(json.dumps(DEFAULT_PROFILES))
+        if not isinstance(self.data.get("usage"), dict):
+            self.data["usage"] = empty_usage()
+        for k, v in empty_usage().items():
+            self.data["usage"].setdefault(k, v)
+        for k in ("nic_exclude", "nic_include"):
+            if not isinstance(self.data.get(k), list):
+                self.data[k] = []
 
         # Migration : les anciennes versions imposaient cinq profils. On les
         # fond en une liste unique, sans perdre les autorisations deja donnees.
@@ -652,6 +1016,80 @@ class State:
                 prof.setdefault(field, val)
         if self.data["active_profile"] not in self.data["profiles"]:
             self.data["active_profile"] = list(self.data["profiles"].keys())[0]
+
+        if schema < 3:
+            if disk:
+                try:
+                    with open(STATE_FILE + ".v2.bak", "w", encoding="utf-8") as f:
+                        json.dump(disk, f, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
+            self._migrate_v3()
+
+    def _migrate_v3(self):
+        """Schema 3 : decisions, catalogue et compteurs sont ranges par
+        identite de programme (app_key) et non plus par chemin exact. Les
+        versions successives d'un meme programme fusionnent en une ligne ;
+        leurs chemins restent dans le catalogue pour les regles du pare-feu.
+        Les seaux "(pid N)" se fondent en un seul "(non attribue)"."""
+        d = self.data
+        ancien = d.get("catalog", {}) or {}
+        cat = {}
+
+        def entree(key, path=None, info=None):
+            e = cat.setdefault(key, {"name": os.path.basename(key) or key,
+                                     "first_seen": time.time(), "paths": []})
+            if info:
+                e["first_seen"] = min(e["first_seen"],
+                                      info.get("first_seen", e["first_seen"]))
+                e["lifetime"] = e.get("lifetime", 0) + info.get("lifetime", 0)
+                if info.get("label"):
+                    e["label"] = info["label"]
+            if path and path not in e["paths"]:
+                e["paths"].append(path)
+
+        # du plus ancien au plus recent : les chemins suivent l'ordre des versions
+        for path, info in sorted(ancien.items(),
+                                 key=lambda kv: kv[1].get("first_seen", 0)):
+            if not path.startswith("("):
+                entree(app_key(path), path, info)
+
+        fusions = 0
+        for prof in d["profiles"].values():
+            apps, vu = {}, {}
+            for path, allow in prof.get("apps", {}).items():
+                key = app_key(path)
+                entree(key, path)
+                ts = ancien.get(path, {}).get("first_seen", 0)
+                if key in apps:
+                    fusions += 1
+                # deux versions tranchees differemment : la plus recente l'emporte
+                if key not in apps or ts >= vu[key]:
+                    apps[key], vu[key] = bool(allow), ts
+            prof["apps"] = apps
+        d["catalog"] = cat
+
+        def cle(k):
+            return UNATTRIBUTED if k.startswith("(") else app_key(k)
+
+        per_app = {}
+        for k, v in d["usage"].get("per_app", {}).items():
+            c = cle(k)
+            slot = per_app.setdefault(c, {"sent": 0, "recv": 0,
+                                          "name": os.path.basename(c) or c})
+            slot["sent"] += v.get("sent", 0)
+            slot["recv"] += v.get("recv", 0)
+        d["usage"]["per_app"] = per_app
+        for jour in (d.get("history") or {}).values():
+            if isinstance(jour, dict) and isinstance(jour.get("per_app"), dict):
+                fusion = {}
+                for k, v in jour["per_app"].items():
+                    fusion[cle(k)] = fusion.get(cle(k), 0) + (v or 0)
+                jour["per_app"] = fusion
+        d["schema"] = 3
+        log_line("migration v3 : %d chemins ranges sous %d programmes, %d doublons "
+                 "de version fusionnes dans les listes"
+                 % (sum(1 for p in ancien if not p.startswith("(")), len(cat), fusions))
 
     def profile_ids(self):
         return list(self.data["profiles"].keys())
@@ -680,23 +1118,62 @@ class State:
     def profile_color(self, pid=None):
         return self.data["profiles"][pid or self.data["active_profile"]]["color"]
 
-    def decided_paths(self):
-        """Applications deja tranchees pour le profil actif (oui ou non)."""
+    # -- programmes --------------------------------------------------------
+    # Les decisions sont rangees par identite (app_key) ; le pare-feu, lui,
+    # veut des chemins exacts : le catalogue garde ceux de chaque identite.
+    def decided_keys(self):
+        """Programmes deja tranches pour le profil actif (oui ou non)."""
         if self.profile.get("allow_all"):
             return set()
         return set(self.profile["apps"].keys())
 
-    def allowed_paths(self):
-        return {p for p, v in self.profile["apps"].items() if v}
+    def allowed_keys(self):
+        return {k for k, v in self.profile["apps"].items() if v}
+
+    def blocked_keys(self):
+        return {k for k, v in self.profile["apps"].items() if not v}
+
+    def note_path(self, path):
+        """Range un chemin exact sous son identite. Renvoie (cle, nouveau)."""
+        path = (path or "").lower()
+        key = app_key(path)
+        e = self.data["catalog"].setdefault(key, {"name": os.path.basename(key) or key,
+                                                  "first_seen": time.time()})
+        paths = e.setdefault("paths", [])
+        if "*" in path or path.startswith("(") or path in paths:
+            return key, False
+        paths.append(path)
+        del paths[:-20]
+        return key, True
+
+    def concrete_paths(self, key):
+        """Chemins exacts a poser dans le pare-feu pour cette identite : les
+        versions vues qui existent encore, sinon celles que le motif retrouve
+        sur le disque. "System" designe le trafic du noyau."""
+        e = self.data["catalog"].get(key, {})
+        out = []
+        for p in list(e.get("paths", [])) + ([key] if "*" not in key else []):
+            if p.startswith("(") or p in out:
+                continue
+            if "\\" in p and not os.path.exists(p):
+                continue
+            out.append(p)
+        if not out and "*" in key:
+            # seules les etoiles sont des jokers ; un dossier "[x86]" est un nom
+            motif = "*".join(glob.escape(morceau) for morceau in key.split("*"))
+            try:
+                out = sorted({p.lower() for p in glob.glob(motif)})
+            except Exception:
+                out = []
+        return ["System" if p == "system" else p for p in out]
 
     def set_app(self, path, allow):
-        self.profile["apps"][path.lower()] = bool(allow)
-        self.data["catalog"].setdefault(path.lower(),
-                                        {"name": os.path.basename(path),
-                                         "first_seen": time.time()})
+        key, _ = self.note_path(path)
+        self.profile["apps"][key] = bool(allow)
+        return key
 
-    def forget_app(self, path):
-        self.profile["apps"].pop(path.lower(), None)
+    def forget_app(self, key):
+        self.profile["apps"].pop(app_key(key), None)
 
     # -- periode -----------------------------------------------------------
     def period_key(self, ref=None):
@@ -740,9 +1217,7 @@ class State:
             }
             for old in sorted(self.data["history"].keys())[:-60]:
                 del self.data["history"][old]
-        self.data["usage"] = {"period": key, "per_app": {}, "per_profile": {},
-                              "per_hour": {}, "total_sent": 0, "total_recv": 0,
-                              "off_sent": 0, "off_recv": 0}
+        self.data["usage"] = empty_usage(key)
         self.data["alerts_fired"] = []
         return True
 
@@ -795,36 +1270,58 @@ class State:
     def schedule_hours(self):
         return self.schedule().count("1") / 2.0
 
-    def quota_bytes(self):
-        return max(1, int(self.data["quota_mb"])) * 1024 * 1024
+    def bonus_bytes(self):
+        """Rallonge accordee pour la periode en cours."""
+        return int(self.data["usage"].get("bonus", 0) or 0)
 
-    def add_usage(self, path, sent, recv, label=None, compte=True):
-        """compte=False : le volume est mesure et attribue a l'application,
-        mais il n'entame pas l'enveloppe. C'est le cas quand la protection
-        est desactivee : NetGate observe sans decompter."""
+    def quota_bytes(self):
+        """Enveloppe de la periode, rallonge comprise."""
+        return max(1, int(self.data["quota_mb"])) * 1024 * 1024 + self.bonus_bytes()
+
+    def exhausted(self):
+        return self.total_used() >= self.quota_bytes()
+
+    def cut_reason(self):
+        """Raison de couper Internet, que la protection soit active ou non :
+        'plage' (hors plage horaire), 'enveloppe' (epuisee, si la coupure est
+        demandee dans les reglages) ou None."""
+        if not self.schedule_open():
+            return "plage"
+        if self.data.get("quota_cut", True) and self.exhausted():
+            return "enveloppe"
+        return None
+
+    def add_total(self, sent, recv, compte=True):
+        """Volume de l'enveloppe, tel que mesure sur la carte reseau.
+        compte=False : protection inactive, le volume est mesure et affiche a
+        part, sans entamer l'enveloppe."""
         u = self.data["usage"]
         if compte:
             u["total_sent"] += sent
             u["total_recv"] += recv
+            pid = self.data["active_profile"]
+            u["per_profile"][pid] = u["per_profile"].get(pid, 0) + sent + recv
         else:
             u["off_sent"] = u.get("off_sent", 0) + sent
             u["off_recv"] = u.get("off_recv", 0) + recv
-        key = (path or "inconnu").lower()
+        h = "%02d" % now_in(self.data["tz_mode"]).hour
+        per_hour = u.setdefault("per_hour", {})
+        per_hour[h] = per_hour.get(h, 0) + sent + recv
+
+    def add_app_usage(self, key, sent, recv, label=None):
+        """Trafic Internet d'un programme (detail de la liste)."""
+        u = self.data["usage"]
         slot = u["per_app"].setdefault(key, {"sent": 0, "recv": 0,
                                              "name": os.path.basename(key) or key})
         slot["sent"] += sent
         slot["recv"] += recv
+        if key.startswith("("):
+            return
         cat = self.data["catalog"].setdefault(key, {"name": os.path.basename(key) or key,
                                                     "first_seen": time.time()})
         cat["lifetime"] = cat.get("lifetime", 0) + sent + recv
         if label:
             cat["label"] = label
-        h = "%02d" % now_in(self.data["tz_mode"]).hour
-        per_hour = u.setdefault("per_hour", {})
-        per_hour[h] = per_hour.get(h, 0) + sent + recv
-        if compte:
-            pid = self.data["active_profile"]
-            u["per_profile"][pid] = u["per_profile"].get(pid, 0) + sent + recv
 
 
 # ==========================================================================
@@ -1550,18 +2047,28 @@ class Tray:
             items.append(pystray.MenuItem("Profil", pystray.Menu(*subs)))
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem(self._usage_text, None, enabled=False))
+        items.append(pystray.MenuItem("Rallonge pour aujourd'hui...", self._rallonge,
+                                      visible=lambda item: self._coupe()))
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem("Tout debloquer (PANIQUE)", self._panic))
         items.append(pystray.MenuItem("Quitter", self._quit))
         return pystray.Menu(*items)
 
+    def _coupe(self):
+        sm = self.app.state_mgr
+        return bool(sm.data["engaged"]) and sm.cut_reason() == "enveloppe"
+
     def _usage_text(self, item=None):
         sm = self.app.state_mgr
-        return "%s / %d Mo  -  %s" % (fmt_bytes(sm.total_used()),
-                                      sm.data["quota_mb"], sm.profile_name())
+        return "%s%s / %s  -  %s" % ("COUPE  -  " if self._coupe() else "",
+                                     fmt_bytes(sm.total_used()),
+                                     fmt_bytes(sm.quota_bytes()), sm.profile_name())
 
     def _open(self, icon=None, item=None):
         self.app.after(0, self.app.show_window)
+
+    def _rallonge(self, icon=None, item=None):
+        self.app.after(0, self.app.rallonge)
 
     def _switch(self, pid):
         self.app.after(0, lambda: self.app.set_profile(pid))
@@ -1589,9 +2096,10 @@ class Tray:
         pct = sm.total_used() / float(sm.quota_bytes())
         try:
             self.icon.icon = self._image(sm.profile_color(), pct)
-            self.icon.title = "%s %s - %s - %s / %d Mo" % (
-                APP_NAME, VERSION_TXT, sm.profile_name(), fmt_bytes(sm.total_used()),
-                sm.data["quota_mb"])
+            self.icon.title = "%s %s - %s - %s%s / %s" % (
+                APP_NAME, VERSION_TXT, sm.profile_name(),
+                "COUPE - " if self._coupe() else "",
+                fmt_bytes(sm.total_used()), fmt_bytes(sm.quota_bytes()))
             self.icon.update_menu()
         except Exception:
             pass
@@ -1619,9 +2127,9 @@ class Tray:
 HELP = [
     ("h1", "NetGate en trois phrases"),
     ("p", "NetGate ferme le robinet Internet pour tout le monde, puis tu l'ouvres "
-          "programme par programme. Il compte ce que chacun consomme et te previent "
-          "quand ton enveloppe du jour s'epuise. Rien n'est jamais coupe sans que tu "
-          "l'aies decide."),
+          "programme par programme. Il compte ce que chacun consomme, te previent "
+          "quand ton enveloppe du jour s'epuise, et coupe Internet quand elle est "
+          "vide si tu le lui as demande."),
 
     ("h1", "Le bouton \"Activer la protection\""),
     ("p", "C'est l'interrupteur general."),
@@ -1631,10 +2139,16 @@ HELP = [
           "utiliser les premieres heures pour decouvrir qui consomme quoi sans rien "
           "casser."),
     ("h2", "Protection active"),
-    ("p", "NetGate donne trois ordres au pare-feu de Windows : le trafic sortant est "
+    ("p", "NetGate donne ses ordres au pare-feu de Windows : le trafic sortant est "
           "refuse par defaut sur les trois profils reseau ; une autorisation est creee "
-          "pour chaque programme de ta liste ; la regle DNS/DHCP est posee si tu l'as "
-          "cochee. Ce qui n'est pas dans ta liste ne sort plus."),
+          "pour chaque programme autorise, une regle de blocage pour chaque programme "
+          "bloque ; la regle DNS/DHCP est posee si tu l'as cochee.\n\n"
+          "Pourquoi des regles de blocage ? Windows et beaucoup de logiciels "
+          "installent leurs propres autorisations (applications du Store, services "
+          "Windows, certains logiciels). Elles continuent de laisser passer leur "
+          "programme malgre le refus par defaut. Une regle de blocage, elle, "
+          "l'emporte toujours : Bloquer veut vraiment dire bloque. Un programme "
+          "encore en attente de reponse peut, lui, passer par ces autorisations-la."),
     ("warn", "Ces regles vivent dans Windows, pas dans NetGate. En quittant "
              "normalement, NetGate les supprime toutes et Internet redevient normal. "
              "Si le programme est tue brutalement, le blocage reste en place : "
@@ -1661,7 +2175,13 @@ HELP = [
           "inverser l'ordre. Double-clic sur une ligne "
           "pour changer d'avis. La fiche du bas explique de quoi il s'agit. Le bouton "
           "Ajouter un programme sert a autoriser quelque chose a l'avance, sans "
-          "attendre qu'il se manifeste."),
+          "attendre qu'il se manifeste.\n\n"
+          "Un programme mis a jour change souvent de dossier (claude_2.110, puis "
+          "claude_2.111...). NetGate le reconnait : une seule ligne, dont le chemin "
+          "porte une etoile a la place du numero de version, et ta decision suit la "
+          "nouvelle version sans reposer la question. La colonne Fichier montre "
+          "l'executable : firefox.exe et pingsender.exe sont deux programmes "
+          "distincts du meme logiciel, chacun avec sa decision."),
 
     ("h1", "L'enveloppe et sa remise a zero"),
     ("p", "L'enveloppe n'est decomptee que lorsque la protection est active. "
@@ -1675,15 +2195,37 @@ HELP = [
           "la consommation de 0 "
           "sans toucher a tes autorisations : utile apres un rechargement de forfait ou "
           "un changement de reseau.\n\n"
-          "Le quota est une reference, pas une barriere : a 50, 80 et 100 pour cent, "
-          "NetGate previent, mais ne coupe rien. L'heure de remise a zero se regle a "
-          "la minute pres, sur l'heure de ton PC ou sur l'heure UTC selon ce "
-          "qu'impose ton fournisseur d'acces."),
+          "A 50, 80 et 100 pour cent, NetGate previent. A 100 pour cent, si la case "
+          "\"Couper Internet quand l'enveloppe est epuisee\" est cochee (c'est le "
+          "reglage par defaut), il coupe Internet jusqu'a la remise a zero : une "
+          "seule regle de blocage vers toutes les adresses Internet, qui passe devant "
+          "toutes les autorisations. Localhost et le reseau local restent ouverts. "
+          "Besoin de finir quelque chose ? Le bouton \"Rallonge pour aujourd'hui\" "
+          "ajoute des Mo pour la journee en cours seulement. La coupure intervient "
+          "dans la seconde : quelques Mo peuvent encore passer pendant ce temps.\n\n"
+          "L'heure de remise a zero se regle a la minute pres, sur l'heure de ton PC "
+          "ou sur l'heure UTC selon ce qu'impose ton fournisseur d'acces."),
+
+    ("h1", "Ce qui est compte"),
+    ("p", "L'enveloppe est mesuree sur la carte reseau par laquelle passent les "
+          "donnees (Wi-Fi, Ethernet, cle 4G, partage de connexion), comme le "
+          "compteur de ton operateur : en-tetes compris, machines virtuelles "
+          "comprises. Ce qui reste dans le PC n'y passe pas : un serveur WAMP, "
+          "MySQL ou PHP interroge en localhost ne coute rien. Le trafic avec le "
+          "reseau local (imprimante, NAS, autre PC) est retire du compte. Les cartes "
+          "virtuelles (VPN, VirtualBox, Hyper-V) ne sont pas comptees : leur trafic "
+          "sort deja par la carte physique. Reglages, bouton \"Cartes decomptees\", "
+          "pour changer ce choix.\n\n"
+          "La colonne Consomme de la liste montre, programme par programme, le "
+          "trafic echange avec Internet. Avec un VPN, le programme et le VPN "
+          "comptent chacun leur part : la liste peut alors depasser l'enveloppe, "
+          "qui reste juste."),
 
     ("h1", "Les plages horaires"),
     ("p", "Reglages, bouton \"Plages horaires\" : un tableau des 48 demi-heures de la "
           "journee. Coche celles pendant lesquelles Internet est autorise. En dehors, "
-          "plus rien ne sort, meme les programmes de ta liste. Les memes horaires "
+          "plus rien ne sort vers Internet, meme les programmes de ta liste, quel "
+          "que soit le profil ; localhost et reseau local restent ouverts. Les memes horaires "
           "s'appliquent tous les jours ; des raccourcis permettent de tout ouvrir, "
           "tout fermer, ou selectionner 08h-22h d'un clic. Le bandeau indique la "
           "prochaine ouverture ou fermeture."),
@@ -1723,8 +2265,13 @@ HELP = [
           "n'est pas cochee.\n"
           "NetGate ne demarre pas : ouvre Terminal (administrateur) et lance-le de la "
           "pour voir l'erreur, ou consulte netgate.log.\n"
-          "Le comptage indique \"global estime\" au lieu du detail : le module "
-          "pywintrace n'est pas installe.\n"
+          "Le bandeau indique \"sans detail par programme\" : le module pywintrace "
+          "n'est pas installe, ou NetGate tourne sans droits administrateur. "
+          "L'enveloppe reste mesuree sur la carte reseau.\n"
+          "Un programme bloque passe quand meme : il est peut-etre encore en attente "
+          "de reponse, et profite d'une autorisation que Windows ou son installateur "
+          "a posee. Reponds Bloquer : une regle de blocage l'emporte sur toutes les "
+          "autorisations.\n"
           "En cas de doute, PANIQUE retablit Internet immediatement."),
 ]
 
@@ -1743,19 +2290,31 @@ class NetGateApp(tk.Tk):
         self.toast = None
         self.profile_cards = {}
         self.help_win = None
-        self.applied = set()      # regles reellement posees dans le pare-feu
+        # Pare-feu : l'interface calcule la cible, un fil d'arriere-plan
+        # l'applique et tient a jour ce qui est reellement pose.
         self._fw_lock = threading.Lock()
         self._fw_busy = False
         self._fw_pending = False
         self._fw_full = False
-        self._slot_state = None   # etat de la plage horaire au dernier passage
+        self._fw_target = None
+        self._fw_msgs = queue.Queue()
+        self.applied = {"engaged": None, "allow": set(), "block": set(),
+                        "cut": None, "ess": None, "lockdown": None}
+        self._cut_state = "?"     # raison de coupure au dernier passage
         self.sort_key = "acces"   # colonne de tri de la liste principale
         self.sort_desc = False
-        self.rates = {}          # chemin -> octets/seconde (instantane)
+        self.rates = {}           # programme -> octets/seconde (instantane)
+        self.rate_total = 0.0     # debit de l'enveloppe, octets/seconde
+        self._lan_reste = [0, 0]  # reseau local deja vu par ETW, pas encore retire
         self._last_tick = time.time()
+        self._tick = 0
+        self._derniere_erreur = ""
 
         self.meter = EtwMeter()
-        self.scanner = ConnScanner(self.state_mgr.decided_paths, self.pending_q)
+        self.nic = NicMeter()
+        # d'ou vient l'enveloppe : "carte", "etw" (estimation) ou None
+        self.env_source = "carte" if self.nic.available else ("etw" if _etw else None)
+        self.scanner = ConnScanner(self.pending_q)
         self.tray = Tray(self)
 
         self.title("%s %s  -  mon enveloppe Internet" % (APP_NAME, VERSION_TXT))
@@ -1771,6 +2330,9 @@ class NetGateApp(tk.Tk):
         self.refresh_window_icon()
 
         self._roll_au_demarrage = self.state_mgr.roll_period_if_needed()
+        self.nic.poll(self._nic_counted)     # point de depart des compteurs
+        self._refresh_addresses()
+        self._sync_watch()
         self.meter.start()
         self.scanner.start()
         self.tray.start()
@@ -1903,6 +2465,9 @@ class NetGateApp(tk.Tk):
         self.lbl_debit = tk.Label(left, text="", bg=C_PANEL, fg=C_ACCENT,
                                   font=("Segoe UI Semibold", 9))
         self.lbl_debit.pack(anchor="w", pady=(4, 0))
+        # n'apparait que lorsque l'enveloppe epuisee a coupe Internet
+        self.btn_rallonge = self._btn(left, "Rallonge pour aujourd'hui...",
+                                      self.rallonge, "warn")
 
         right = tk.Frame(head, bg=C_PANEL)
         right.pack(side="right", padx=22, pady=16)
@@ -1997,12 +2562,17 @@ class NetGateApp(tk.Tk):
         self.lbl_info_corps.pack(fill="both", expand=True, padx=14, pady=(3, 10))
         card.bind("<Configure>", self._fit_info_card)
 
-        cols = ("app", "acces", "conso", "path")
-        heads = (("app", "Application", 240, "w"),
-                 ("acces", "Acces", 110, "center"),
-                 ("conso", "Consomme", 110, "e"),
-                 ("path", "Emplacement", 380, "w"))
-        self.tv_apps = ttk.Treeview(f, columns=cols, show="headings", selectmode="browse")
+        # "Fichier" montre toujours l'executable : deux programmes d'un meme
+        # logiciel (firefox.exe, pingsender.exe) ne passent plus pour un
+        # doublon. La colonne "key", masquee, porte l'identite du programme.
+        cols = ("app", "file", "acces", "conso", "path", "key")
+        heads = (("app", "Application", 230, "w"),
+                 ("file", "Fichier", 150, "w"),
+                 ("acces", "Acces", 95, "center"),
+                 ("conso", "Consomme", 95, "e"),
+                 ("path", "Emplacement", 300, "w"))
+        self.tv_apps = ttk.Treeview(f, columns=cols, displaycolumns=cols[:-1],
+                                    show="headings", selectmode="browse")
         for c, t, w, a in heads:
             self.tv_apps.heading(c, text=t, command=(lambda k=c: self.sort_apps(k)))
             self.tv_apps.column(c, width=w, anchor=a, stretch=(c == "path"))
@@ -2075,13 +2645,11 @@ class NetGateApp(tk.Tk):
         """En quittant, NetGate remet toujours Internet dans son etat normal :
         politique sortante par defaut et suppression de toutes les regles
         NETGATE_. Aucune question, rien ne peut rester bloque."""
-        d = self.state_mgr.data
         try:
-            Firewall.panic_restore(self._all_known_paths())
+            self._restore_now()
             log_line("fermeture : regles NETGATE_ supprimees, sortant retabli")
         except Exception:
             log_error("nettoyage du pare-feu a la fermeture")
-        d["engaged"] = False
         self.state_mgr.save()
         self.meter.stop()
         self.scanner.stop()
@@ -2090,15 +2658,59 @@ class NetGateApp(tk.Tk):
 
     # -------------------------------------------------------------- moteur
     def _all_known_paths(self):
-        paths = set(self.state_mgr.data["catalog"].keys())
-        for prof in self.state_mgr.data["profiles"].values():
-            paths |= set(prof.get("apps", {}).keys())
+        """Tous les chemins exacts pour lesquels une regle a pu etre posee."""
+        sm = self.state_mgr
+        paths = set()
+        for key, e in sm.data["catalog"].items():
+            if key.startswith("("):
+                continue
+            paths.update(e.get("paths", []))
+            if "*" not in key:
+                paths.add(key)
+        for prof in sm.data["profiles"].values():
+            paths.update(k for k in prof.get("apps", {}) if "*" not in k)
+        paths |= self.applied["allow"] | self.applied["block"]
+        paths.discard("")
         return paths
+
+    def _fw_plan(self):
+        """Ce que le pare-feu doit contenir maintenant. Calcule dans le fil
+        de l'interface, seul a modifier l'etat ; le fil du pare-feu n'a plus
+        qu'a appliquer la difference."""
+        sm = self.state_mgr
+        d = sm.data
+        plan = {"engaged": bool(d["engaged"]), "known": self._all_known_paths(),
+                "libre": bool(sm.profile.get("allow_all")), "nom": sm.profile_name(),
+                "allow": set(), "block": set(), "labels": {},
+                "cut": sm.cut_reason(), "ess": bool(d["essentials_dns"])}
+        plan["lockdown"] = not plan["libre"]
+        if not plan["engaged"] or plan["libre"]:
+            return plan
+        for keys, cible in ((sm.allowed_keys(), plan["allow"]),
+                            (sm.blocked_keys(), plan["block"])):
+            for k in keys:
+                # une regle de blocage sur svchost l'emporterait aussi sur la
+                # regle DNS/DHCP : plus aucun nom ne se resoudrait. svchost
+                # bloque reste donc a la politique par defaut.
+                if cible is plan["block"] and os.path.basename(k) == "svchost.exe":
+                    continue
+                lab = d["catalog"].get(k, {}).get("label") or ""
+                for p in sm.concrete_paths(k):
+                    cible.add(p)
+                    plan["labels"][p] = lab
+        plan["block"] -= plan["allow"]
+        return plan
 
     def apply_firewall(self, full=False):
         """Ne touche que ce qui change, et travaille en arriere-plan pour que
         l'interface reponde immediatement."""
+        try:
+            target = self._fw_plan()
+        except Exception:
+            log_error("preparation des regles du pare-feu")
+            return
         with self._fw_lock:
+            self._fw_target = target
             self._fw_pending = True
             self._fw_full = self._fw_full or full
             if self._fw_busy:
@@ -2108,75 +2720,112 @@ class NetGateApp(tk.Tk):
         threading.Thread(target=self._fw_worker, daemon=True, name="Firewall").start()
 
     def _fw_worker(self):
+        # aucun appel a Tk depuis ce fil : les messages passent par une file
+        # que la boucle rapide affiche
         while True:
             with self._fw_lock:
                 if not self._fw_pending:
                     self._fw_busy = False
                     return
                 self._fw_pending = False
-                full = self._fw_full
-                self._fw_full = False
+                full, self._fw_full = self._fw_full, False
+                target = self._fw_target
             try:
-                msg = self._fw_sync(full)
+                msg = self._fw_sync(target, full)
             except Exception:
                 log_error("application des regles au pare-feu")
                 msg = "Erreur pare-feu, voir netgate.log"
-            self.after(0, lambda m=msg: self.status(m))
+                with self._fw_lock:
+                    self._fw_full = True        # la prochaine fois, tout reprendre
+            self._fw_msgs.put(msg)
 
-    def _fw_sync(self, full):
-        sm = self.state_mgr
-        d = sm.data
+    def _fw_wait_idle(self, timeout=20.0):
+        """Annule ce qui restait a appliquer et attend la fin du fil du
+        pare-feu : un nettoyage ne doit pas etre suivi d'une ecriture en
+        retard qui reposerait des regles."""
+        with self._fw_lock:
+            self._fw_pending = False
+        fin = time.time() + timeout
+        while time.time() < fin:
+            with self._fw_lock:
+                if not self._fw_busy:
+                    return
+            time.sleep(0.05)
+
+    def _restore_now(self):
+        """Retour immediat a un pare-feu sans NetGate (PANIQUE, fermeture,
+        effacement des autorisations)."""
+        self.state_mgr.data["engaged"] = False
+        self._fw_wait_idle()
+        Firewall.panic_restore(self._all_known_paths())
+        self.applied = {"engaged": False, "allow": set(), "block": set(),
+                        "cut": False, "ess": False, "lockdown": False}
+
+    def _fw_sync(self, t, full):
+        a = self.applied
         debut = time.time()
+        lines = []
 
-        if not d["engaged"]:
-            lines = list(Firewall.line_lockdown(False))
-            for p in (self._all_known_paths() if full else self.applied):
-                lines += Firewall.line_delete(p)
-            lines += Firewall.lines_essentials(False)
+        if not t["engaged"]:
+            if full or a["engaged"] is not False:
+                lines += Firewall.line_lockdown(False)
+                lines += Firewall.lines_cut(False)
+                for p in (t["known"] | a["allow"] | a["block"]) if full \
+                        else (a["allow"] | a["block"]):
+                    lines += Firewall.line_delete(p)
+                lines += Firewall.lines_essentials(False)
             Firewall.run_script(lines)
-            self.applied = set()
+            self.applied = {"engaged": False, "allow": set(), "block": set(),
+                            "cut": False, "ess": False, "lockdown": False}
             return "Protection desactivee"
 
-        if sm.profile.get("allow_all"):
-            lines = list(Firewall.line_lockdown(False))
-            for p in (self._all_known_paths() if full else self.applied):
+        if full:
+            for p in t["known"] - t["allow"] - t["block"]:
                 lines += Firewall.line_delete(p)
-            Firewall.run_script(lines)
-            self.applied = set()
-            return "Profil %s : aucun filtrage, le compteur tourne" % sm.profile_name()
-
-        if not sm.schedule_open():
-            souhaite = set()          # hors plage horaire : plus rien ne sort
+            # chaque ajout retire d'abord sa propre regle ; l'autre sorte de
+            # regle peut exister d'avant (programme passe de bloque a autorise)
+            for p in t["allow"]:
+                lines += Firewall.line_delete(p, ("BLK",))
+            for p in t["block"]:
+                lines += Firewall.line_delete(p, ("OUT",))
+            add_allow, add_block = t["allow"], t["block"]
         else:
-            souhaite = set(sm.allowed_paths())
-        if full:
-            a_retirer = self._all_known_paths() - souhaite
-            a_ajouter = souhaite
-        else:
-            a_retirer = self.applied - souhaite
-            a_ajouter = souhaite - self.applied
-
-        lines = []
-        for p in a_retirer:
-            lines += Firewall.line_delete(p)
-        for p in a_ajouter:
-            lines += Firewall.line_allow(p, self.state_mgr.data["catalog"]
-                                         .get(p, {}).get("name", ""))
-        if full:
-            lines += Firewall.lines_essentials(bool(d["essentials_dns"]))
-        lines += Firewall.line_lockdown(True)
+            for p in a["allow"] - t["allow"]:
+                lines += Firewall.line_delete(p, ("OUT",))
+            for p in a["block"] - t["block"]:
+                lines += Firewall.line_delete(p, ("BLK",))
+            add_allow, add_block = t["allow"] - a["allow"], t["block"] - a["block"]
+        for p in sorted(add_allow):
+            lines += Firewall.line_allow(p, t["labels"].get(p, ""))
+        for p in sorted(add_block):
+            lines += Firewall.line_block(p, t["labels"].get(p, ""))
+        if full or t["ess"] != a["ess"]:
+            lines += Firewall.lines_essentials(t["ess"])
+        coupe = bool(t["cut"])
+        if full or coupe != a["cut"]:
+            lines += Firewall.lines_cut(coupe)
+        # la politique en dernier : les autorisations sont deja en place
+        if full or t["lockdown"] != a["lockdown"]:
+            lines += Firewall.line_lockdown(t["lockdown"])
 
         Firewall.run_script(lines)
-        self.applied = souhaite
-        delai = time.time() - debut
-        if not sm.schedule_open():
-            suite = sm.schedule_next_change()
+        self.applied = {"engaged": True, "allow": set(t["allow"]),
+                        "block": set(t["block"]), "cut": coupe, "ess": t["ess"],
+                        "lockdown": t["lockdown"]}
+        if t["cut"] == "enveloppe":
+            return ("Enveloppe epuisee : Internet coupe jusqu'a la remise a zero "
+                    "(localhost et reseau local restent ouverts)")
+        if t["cut"] == "plage":
+            suite = self.state_mgr.schedule_next_change()
             return ("Hors plage horaire : Internet coupe" +
                     (" jusqu'a %s" % suite[1] if suite else ""))
-        if not a_retirer and not a_ajouter:
-            return "Protection active - %d programmes autorises" % len(souhaite)
-        return ("Regles a jour : %d ajoutees, %d retirees (%.1f s)"
-                % (len(a_ajouter), len(a_retirer), delai))
+        if t["libre"]:
+            return "Profil %s : aucun filtrage, le compteur tourne" % t["nom"]
+        if not lines:
+            return ("Protection active - %d programmes autorises, %d bloques"
+                    % (len(t["allow"]), len(t["block"])))
+        return ("Regles a jour en %.1f s : %d programmes autorises, %d bloques"
+                % (time.time() - debut, len(t["allow"]), len(t["block"])))
 
     def toggle_engage(self):
         d = self.state_mgr.data
@@ -2196,6 +2845,7 @@ class NetGateApp(tk.Tk):
             return
         sm.data["active_profile"] = pid
         self.scanner.reset_asked()
+        self._sync_watch()
         # l'ecran se met a jour tout de suite ; le pare-feu suit en arriere-plan
         self.refresh_all()
         self.refresh_window_icon()
@@ -2209,28 +2859,80 @@ class NetGateApp(tk.Tk):
                                    "Retablir Internet normalement et supprimer "
                                    "toutes les regles NetGate ?"):
             return
-        Firewall.panic_restore(self._all_known_paths())
-        self.state_mgr.data["engaged"] = False
+        self._restore_now()
         self.state_mgr.save()
+        self.refresh_all()
         self.status("Internet retabli, regles NetGate supprimees.")
 
-    # --------------------------------------------------------- decisions
-    def apply_decision(self, path, allow):
+    def rallonge(self):
+        """Ajoute des Mo a l'enveloppe, pour la periode en cours seulement :
+        le reglage de l'enveloppe ne change pas, la rallonge disparait a la
+        remise a zero."""
+        from tkinter import simpledialog
         sm = self.state_mgr
-        sm.set_app(path, allow)
+        n = simpledialog.askinteger(
+            "Rallonge",
+            "Combien de Mo ajouter a l'enveloppe, pour aujourd'hui seulement ?\n\n"
+            "Consomme : %s sur %s." % (fmt_bytes(sm.total_used()),
+                                       fmt_bytes(sm.quota_bytes())),
+            parent=self, minvalue=1, maxvalue=1000000, initialvalue=50)
+        if not n:
+            return
+        sm.data["usage"]["bonus"] = sm.bonus_bytes() + n * 1024 * 1024
+        log_line("rallonge de %d Mo pour la periode %s" % (n, sm.data["usage"]["period"]))
+        self._icon_sig = None
+        sm.save()
+        self._check_cut()
+        self.refresh_all()
+        self.refresh_window_icon()
+        self.tray.refresh()
+        self.status("Rallonge de %d Mo accordee jusqu'a la remise a zero" % n)
+
+    # --------------------------------------------------------- decisions
+    def _sync_watch(self):
+        """Le scanner surveille les nouvelles versions des programmes tranches."""
+        self.scanner.watch = frozenset(self.state_mgr.profile["apps"].keys())
+
+    def _on_scanned(self, item):
+        """Tri de ce que remonte le scanner. Renvoie True si une demande
+        rejoint la liste d'attente."""
+        sm = self.state_mgr
+        key, nouveau = sm.note_path(item["path"])
+        item["key"] = key
+        if key in sm.profile["apps"]:
+            # nouvelle version d'un programme deja tranche : la decision
+            # suit, sans reposer la question
+            if nouveau and sm.data["engaged"]:
+                self.apply_firewall()
+            return False
+        if item.get("src") != "conn" or key in sm.decided_keys():
+            return False
+        if any(p.get("key") == key for p in self.pending):
+            return False
+        if self.toast is not None and self.toast.item.get("key") == key:
+            return False
+        self.pending.append(item)
+        return True
+
+    def apply_decision(self, path, allow):
+        """path : chemin exact (carte de demande) ou identite (liste)."""
+        sm = self.state_mgr
+        key = sm.set_app(path, allow)
+        self._sync_watch()
         if sm.data["engaged"]:
             self.apply_firewall()
-        self.pending = [p for p in self.pending if p["path"].lower() != path.lower()]
+        self.pending = [p for p in self.pending if p.get("key") != key]
+        self.refresh_pending_label()
         sm.save()
         self.refresh_apps()
         self.status("%s : %s dans le profil %s"
-                    % (os.path.basename(path), "autorise" if allow else "bloque",
+                    % (self.label_for(key), "autorise" if allow else "bloque",
                        sm.profile_name()))
 
     def on_toast_decision(self, item, value):
         self.toast = None
         if value is None:
-            if item not in self.pending:
+            if not any(p.get("key") == item.get("key") for p in self.pending):
                 self.pending.append(item)
             self.refresh_pending_label()
         else:
@@ -2242,7 +2944,7 @@ class NetGateApp(tk.Tk):
             return
         while self.pending:
             item = self.pending[0]
-            if item["path"].lower() in self.state_mgr.profile["apps"]:
+            if item.get("key") in self.state_mgr.profile["apps"]:
                 self.pending.pop(0)
                 continue
             break
@@ -2250,7 +2952,7 @@ class NetGateApp(tk.Tk):
             return
         item = self.pending.pop(0)
         lifetime = self.state_mgr.data["catalog"].get(
-            item["path"].lower(), {}).get("lifetime", 0)
+            item.get("key"), {}).get("lifetime", 0)
         try:
             self.toast = AuthToast(self, item, self.state_mgr.profile_color(),
                                    int(self.state_mgr.data["notify_timeout"]),
@@ -2262,21 +2964,26 @@ class NetGateApp(tk.Tk):
         sel = self.tv_apps.selection()
         if not sel:
             return None
-        return self.tv_apps.item(sel[0], "values")[3]
+        return self.tv_apps.item(sel[0], "values")[5]
 
-    def label_for(self, path):
+    def _concrete(self, key):
+        """Un chemin reel pour une identite : la version la plus recente."""
+        paths = self.state_mgr.concrete_paths(key)
+        return paths[-1] if paths else key
+
+    def label_for(self, key):
         """Nom comprehensible : description du fichier, sinon glossaire,
         sinon nom brut. Mis en cache dans le catalogue."""
-        if not path or path.startswith("("):
-            return "Trafic non attribue" if path else "?"
-        key = path.lower()
+        if not key or key.startswith("("):
+            return "Trafic non attribue" if key else "?"
+        key = key.lower()
         cat = self.state_mgr.data["catalog"].get(key)
         if cat and cat.get("label"):
             return cat["label"]
         try:
-            lab = Inspector.fast(path, None)["titre"] or os.path.basename(path)
+            lab = Inspector.fast(self._concrete(key), None)["titre"] or os.path.basename(key)
         except Exception:
-            lab = os.path.basename(path)
+            lab = os.path.basename(key)
         if cat is not None:
             cat["label"] = lab
         return lab
@@ -2364,8 +3071,9 @@ class NetGateApp(tk.Tk):
             sm.data["schedule"] = "".join("1" if v.get() else "0" for v in cases)
             sm.data["schedule_enabled"] = bool(v_actif.get())
             sm.save()
-            self._slot_state = None          # force la reevaluation
-            self.apply_firewall()
+            self._check_cut()
+            if sm.data["engaged"]:
+                self.apply_firewall()
             self.refresh_all()
             w.destroy()
 
@@ -2390,14 +3098,12 @@ class NetGateApp(tk.Tk):
                 % (sm.data["quota_mb"], fmt_bytes(sm.total_used())), parent=hote):
             return
         ancien = sm.total_used()
-        sm.data["usage"] = {"period": sm.period_key(), "per_app": {},
-                            "per_profile": {}, "per_hour": {},
-                            "total_sent": 0, "total_recv": 0,
-                            "off_sent": 0, "off_recv": 0}
+        sm.data["usage"] = empty_usage(sm.period_key())
         sm.data["alerts_fired"] = []
         self.rates = {}
         self._icon_sig = None
         sm.save()
+        self._check_cut()
         self.refresh_all()
         self.refresh_window_icon()
         self.tray.refresh()
@@ -2568,8 +3274,7 @@ class NetGateApp(tk.Tk):
     def do_reset(self, jour, hist, apps, tout):
         sm = self.state_mgr
         if apps or tout:
-            Firewall.panic_restore(self._all_known_paths())
-            sm.data["engaged"] = False
+            self._restore_now()
         if tout:
             try:
                 os.remove(STATE_FILE)
@@ -2578,10 +3283,7 @@ class NetGateApp(tk.Tk):
             sm.data = json.loads(json.dumps(DEFAULT_STATE))
         else:
             if jour:
-                sm.data["usage"] = {"period": sm.period_key(), "per_app": {},
-                                    "per_profile": {}, "per_hour": {},
-                                    "total_sent": 0, "total_recv": 0,
-                                    "off_sent": 0, "off_recv": 0}
+                sm.data["usage"] = empty_usage(sm.period_key())
                 sm.data["alerts_fired"] = []
             if hist:
                 sm.data["history"] = {}
@@ -2592,6 +3294,8 @@ class NetGateApp(tk.Tk):
         self.pending = []
         self.rates = {}
         self.scanner.reset_asked()
+        self._sync_watch()
+        self._check_cut()
         Inspector._ver_cache.clear()
         Inspector._sig_cache.clear()
         Inspector._dns_cache.clear()
@@ -2781,19 +3485,19 @@ class NetGateApp(tk.Tk):
         return txt if len(txt) <= n else txt[:n - 1].rstrip() + "\u2026"
 
     def show_app_info(self):
-        path = self.selected_path()
-        if not path:
+        key = self.selected_path()
+        if not key:
             return
-        pid = None
+        pid, path = None, self._concrete(key)
         for it in self.pending:
-            if it["path"].lower() == path.lower():
-                pid = it.get("pid")
+            if it.get("key") == key:
+                pid, path = it.get("pid"), it["path"]
                 break
         info = Inspector.fast(path, pid)
         col, lab = NIVEAU_STYLE.get(info["niveau"], NIVEAU_STYLE["utile"])
         self.lbl_info_titre.configure(
             text=self._court(info["titre"] or os.path.basename(path), 90), fg=col)
-        cat = self.state_mgr.data["catalog"].get(path.lower(), {})
+        cat = self.state_mgr.data["catalog"].get(key, {})
 
         # quatre lignes au maximum : la fiche a une hauteur fixe
         lignes = ["[%s]  %s%s" % (lab, info["origine"],
@@ -2819,7 +3523,7 @@ class NetGateApp(tk.Tk):
         p = self.selected_path()
         if not p:
             return
-        cur = self.state_mgr.profile["apps"].get(p.lower(), False)
+        cur = self.state_mgr.profile["apps"].get(p, False)
         self.apply_decision(p, not cur)
 
     def remove_app(self):
@@ -2828,6 +3532,9 @@ class NetGateApp(tk.Tk):
             return
         self.state_mgr.forget_app(p)
         self.scanner.forget(p)
+        self._sync_watch()
+        self.pending = [it for it in self.pending if it.get("key") != p]
+        self.refresh_pending_label()
         if self.state_mgr.data["engaged"]:
             self.apply_firewall()
         self.state_mgr.save()
@@ -2860,6 +3567,7 @@ class NetGateApp(tk.Tk):
         v_notif = tk.BooleanVar(value=d["notify_enabled"])
         v_to = tk.StringVar(value=str(d["notify_timeout"]))
         v_min = tk.BooleanVar(value=d["start_minimized"])
+        v_cut = tk.BooleanVar(value=d.get("quota_cut", True))
 
         rows = [
             ("Enveloppe du jour (Mo)", v_quota, None),
@@ -2879,7 +3587,8 @@ class NetGateApp(tk.Tk):
                                                                 sticky="w", padx=12)
             r += 1
 
-        for label, var in (("Autoriser DNS/DHCP (indispensable en mode protege)", v_dns),
+        for label, var in (("Couper Internet quand l'enveloppe est epuisee", v_cut),
+                           ("Autoriser DNS/DHCP (indispensable en mode protege)", v_dns),
                            ("Afficher une notification a chaque demande", v_notif),
                            ("Demarrer reduit dans la zone de notification", v_min)):
             ttk.Checkbutton(frm, text=label, variable=var).grid(
@@ -2888,9 +3597,26 @@ class NetGateApp(tk.Tk):
 
         tk.Label(frm, bg=C_PANEL, fg=C_TXT_DIM, justify="left", wraplength=430,
                  font=("Segoe UI", 8),
-                 text=("Aucune coupure automatique : au-dela de l'enveloppe, "
-                       "NetGate previent seulement (50 %, 80 %, 100 %).")
+                 text=("Enveloppe epuisee, protection active : Internet est coupe "
+                       "jusqu'a la remise a zero, localhost et reseau local restent "
+                       "ouverts, et une rallonge du jour reste possible. Case "
+                       "decochee : NetGate previent seulement (50 %, 80 %, 100 %).")
                  ).grid(row=r, column=0, columnspan=2, sticky="w", pady=(12, 4))
+        r += 1
+
+        zcarte = tk.Frame(frm, bg=C_PANEL)
+        zcarte.grid(row=r, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        lbl_cartes = tk.Label(zcarte, bg=C_PANEL, fg=C_TXT_DIM, font=("Segoe UI", 9))
+
+        def maj_cartes():
+            noms = self._counted_names()
+            lbl_cartes.configure(text="  enveloppe mesuree sur : " +
+                                 (", ".join(noms) if noms else "aucune carte"))
+
+        self._btn(zcarte, "Cartes decomptees...",
+                  lambda: self.open_nics(w, maj_cartes)).pack(side="left")
+        lbl_cartes.pack(side="left")
+        maj_cartes()
         r += 1
 
         zplage = tk.Frame(frm, bg=C_PANEL)
@@ -2974,13 +3700,17 @@ class NetGateApp(tk.Tk):
             d["tz_mode"] = v_tz.get()
             d["notify_enabled"] = bool(v_notif.get())
             d["start_minimized"] = bool(v_min.get())
-            new_dns = bool(v_dns.get())
-            if new_dns != d["essentials_dns"]:
-                d["essentials_dns"] = new_dns
-                Firewall.set_essentials_dns(new_dns and d["engaged"])
+            d["quota_cut"] = bool(v_cut.get())
+            d["essentials_dns"] = bool(v_dns.get())
             self.state_mgr.roll_period_if_needed()
             self.state_mgr.save()
+            self._icon_sig = None
+            self._check_cut()
+            if d["engaged"]:
+                self.apply_firewall()       # DNS/DHCP, coupure : seul ce qui change
             self.refresh_all()
+            self.refresh_window_icon()
+            self.tray.refresh()
             w.destroy()
             self.status("Reglages enregistres")
 
@@ -2988,6 +3718,71 @@ class NetGateApp(tk.Tk):
         bar.grid(row=r, column=0, columnspan=2, sticky="e", pady=(14, 0))
         self._btn(bar, "Annuler", w.destroy).pack(side="right", padx=(8, 0))
         self._btn(bar, "Enregistrer", save, "accent").pack(side="right")
+
+    def open_nics(self, parent=None, on_close=None):
+        """Choix des cartes reseau dont le trafic entame l'enveloppe. Par
+        defaut : les cartes physiques (Wi-Fi, Ethernet, cle 4G, Bluetooth)."""
+        d = self.state_mgr.data
+        try:
+            # releve frais, sans toucher aux points de depart du comptage
+            toutes = self.nic.read() if self.nic.available else []
+        except Exception:
+            toutes = self.nic.ifaces
+        cartes = [it for it in toutes
+                  if it["physique"] or it["guid"] in d["nic_include"]
+                  or (it["up"] and (it["rx"] or it["tx"]))]
+        w = tk.Toplevel(parent or self)
+        w.title("Cartes decomptees")
+        w.configure(bg=C_PANEL)
+        w.resizable(False, False)
+        w.transient(parent or self)
+        w.grab_set()
+        frm = tk.Frame(w, bg=C_PANEL)
+        frm.pack(padx=24, pady=20)
+        tk.Label(frm, text="Cartes reseau decomptees", bg=C_PANEL, fg=C_TXT,
+                 font=("Segoe UI Semibold", 13)).pack(anchor="w")
+        tk.Label(frm, bg=C_PANEL, fg=C_TXT_DIM, justify="left", wraplength=520,
+                 font=("Segoe UI", 9),
+                 text=("L'enveloppe compte ce qui passe par les cartes cochees, "
+                       "comme le compteur de l'operateur. Localhost (serveurs "
+                       "locaux, WAMP, MySQL) ne passe par aucune carte, et le "
+                       "trafic du reseau local est retire. Ne coche pas une carte "
+                       "virtuelle (VPN, VirtualBox, Hyper-V) : son trafic sort deja "
+                       "par la carte physique, il serait compte deux fois.")
+                 ).pack(anchor="w", pady=(2, 12))
+        choix = {}
+        if not cartes:
+            tk.Label(frm, bg=C_PANEL, fg=C_WARN, font=("Segoe UI", 9),
+                     text="Aucune carte lisible : l'enveloppe est estimee programme "
+                          "par programme.").pack(anchor="w")
+        for it in sorted(cartes, key=lambda i: (not i["physique"], i["alias"].lower())):
+            v = tk.BooleanVar(value=self._nic_counted(it))
+            choix[it["guid"]] = (it, v)
+            ttk.Checkbutton(frm, text="%s  -  %s" % (it["alias"], it["desc"]),
+                            variable=v).pack(anchor="w", pady=(4, 0))
+            tk.Label(frm, bg=C_PANEL, fg=C_TXT_DIM, font=("Segoe UI", 8),
+                     text="%s, %s, %s depuis le demarrage de Windows" % (
+                         "physique" if it["physique"] else "virtuelle",
+                         "connectee" if it["up"] else "deconnectee",
+                         fmt_bytes(it["rx"] + it["tx"]))).pack(anchor="w", padx=24)
+
+        def enregistrer():
+            absentes_ex = [g for g in d["nic_exclude"] if g not in choix]
+            absentes_in = [g for g in d["nic_include"] if g not in choix]
+            d["nic_exclude"] = [g for g, (it, v) in choix.items()
+                                if it["physique"] and not v.get()] + absentes_ex
+            d["nic_include"] = [g for g, (it, v) in choix.items()
+                                if not it["physique"] and v.get()] + absentes_in
+            self.state_mgr.save()
+            self._refresh_addresses()
+            w.destroy()
+            if on_close:
+                on_close()
+
+        bar = tk.Frame(frm, bg=C_PANEL)
+        bar.pack(fill="x", pady=(16, 0))
+        self._btn(bar, "Annuler", w.destroy).pack(side="right", padx=(8, 0))
+        self._btn(bar, "Enregistrer", enregistrer, "accent").pack(side="right")
 
     # -------------------------------------------------------- rafraichis.
     def refresh_header(self):
@@ -2997,7 +3792,10 @@ class NetGateApp(tk.Tk):
         pct = used / float(quota)
         self.lbl_used.configure(text=fmt_bytes(used))
         hors = sm.off_used()
-        txt = "sur %d Mo  -  %.0f %% de l'enveloppe" % (d["quota_mb"], 100 * pct)
+        txt = "sur %d Mo" % d["quota_mb"]
+        if sm.bonus_bytes():
+            txt += " + %s de rallonge" % fmt_bytes(sm.bonus_bytes())
+        txt += "  -  %.0f %% de l'enveloppe" % (100 * pct)
         if not d["engaged"]:
             txt += "   (protection inactive : rien n'est decompte)"
         elif hors:
@@ -3011,29 +3809,40 @@ class NetGateApp(tk.Tk):
         rem = sm.next_reset()
         hh, rr = divmod(int(rem.total_seconds()), 3600)
         mm, ss = divmod(rr, 60)
-        self.lbl_reset.configure(text="Remise a zero dans %02d h %02d min %02d s "
-                                      "(a %02d:%02d, heure %s)"
-                                      % (hh, mm, ss, d["reset_hh"], d["reset_mm"],
-                                         "UTC" if d["tz_mode"] == "utc" else "du PC"))
-        live = sum(self.rates.values())
+        ligne = ("Remise a zero dans %02d h %02d min %02d s (a %02d:%02d, heure %s)"
+                 % (hh, mm, ss, d["reset_hh"], d["reset_mm"],
+                    "UTC" if d["tz_mode"] == "utc" else "du PC"))
+        couleur = C_TXT_DIM
+        raison = sm.cut_reason() if d["engaged"] else None
+        suite = sm.schedule_next_change()
+        if raison == "plage":
+            ligne = ("INTERNET COUPE (hors plage horaire)" +
+                     ("   -   reouverture a %s" % suite[1] if suite else ""))
+            couleur = C_DANGER
+        elif raison == "enveloppe":
+            ligne = ("INTERNET COUPE : enveloppe epuisee, retour a la remise a zero "
+                     "dans %02d h %02d min" % (hh, mm))
+            couleur = C_DANGER
+        elif d.get("schedule_enabled") and suite:
+            ligne += ("   |   plage ouverte jusqu'a %s" % suite[1] if sm.schedule_open()
+                      else "   |   hors plage jusqu'a %s" % suite[1])
+        self.lbl_reset.configure(text=ligne, fg=couleur)
+        # le bouton de rallonge n'a de sens que pendant la coupure
+        if (raison == "enveloppe") != bool(self.btn_rallonge.winfo_manager()):
+            if raison == "enveloppe":
+                self.btn_rallonge.pack(anchor="w", pady=(8, 0))
+            else:
+                self.btn_rallonge.pack_forget()
+        live = self.rate_total
         if live > 1024:
-            gros = max(self.rates.items(), key=lambda kv: kv[1])
-            self.lbl_debit.configure(
-                text="%s/s en ce moment  -  surtout %s"
-                     % (fmt_bytes(live), self.label_for(gros[0])),
-                fg=C_WARN if live > 200 * 1024 else C_ACCENT)
+            txt = "%s/s en ce moment" % fmt_bytes(live)
+            gros = max(self.rates.items(), key=lambda kv: kv[1]) if self.rates else None
+            if gros and gros[1] > 0:
+                txt += "  -  surtout %s" % self.label_for(gros[0])
+            self.lbl_debit.configure(text=txt,
+                                     fg=C_WARN if live > 200 * 1024 else C_ACCENT)
         else:
             self.lbl_debit.configure(text="Trafic au repos", fg=C_TXT_DIM)
-        suite = sm.schedule_next_change()
-        if d.get("schedule_enabled"):
-            if sm.schedule_open():
-                self.lbl_reset.configure(
-                    text=self.lbl_reset.cget("text") +
-                         ("   |   plage ouverte jusqu'a %s" % suite[1] if suite else ""))
-            else:
-                self.lbl_reset.configure(
-                    text="INTERNET COUPE (hors plage horaire)" +
-                         ("   -   reouverture a %s" % suite[1] if suite else ""))
         if d["engaged"]:
             if sm.profile.get("allow_all"):
                 self.lbl_shield.configure(text="PROTECTION ACTIVE - profil Libre",
@@ -3046,9 +3855,19 @@ class NetGateApp(tk.Tk):
             self.lbl_shield.configure(text="PROTECTION INACTIVE", fg=C_WARN)
             self.btn_engage.configure(text="Activer la protection",
                                       bg=C_ACCENT, fg="#06101d")
-        self.lbl_engine.configure(
-            text="comptage %s" % ("detaille par application"
-                                  if self.meter.mode == "etw" else "global estime"))
+        if self.env_source == "carte":
+            noms = self._counted_names(connectees=True) or self._counted_names()
+            lignes = ["enveloppe mesuree sur : %s" % (", ".join(noms) or "?")]
+        elif self.env_source == "etw":
+            lignes = ["enveloppe estimee programme par programme"]
+        else:
+            lignes = ["aucun comptage disponible"]
+        lignes.append("detail par programme" if self.meter.mode == "etw"
+                      else "sans detail par programme")
+        local = d["usage"].get("local", 0)
+        if local:
+            lignes.append("localhost et reseau local ecartes : %s" % fmt_bytes(local))
+        self.lbl_engine.configure(text="\n".join(lignes), justify="right")
 
     def refresh_profiles(self):
         sm = self.state_mgr
@@ -3091,12 +3910,13 @@ class NetGateApp(tk.Tk):
             text="Applications  -  %s%s" % (sm.profile_name(),
                                             "" if not sm.multi_profiles() else ""))
         sel = self.tv_apps.selection()
-        selval = self.tv_apps.item(sel[0], "values")[3] if sel else None
+        selval = self.tv_apps.item(sel[0], "values")[5] if sel else None
         self.tv_apps.delete(*self.tv_apps.get_children())
 
         entries = dict(sm.profile["apps"])
         for it in self.pending:
-            entries.setdefault(it["path"].lower(), None)
+            entries.setdefault(it.get("key") or app_key(it["path"]), None)
+        noms = {k: self.label_for(k) for k in entries}
 
         def conso_of(path):
             u = per_app.get(path, {})
@@ -3109,22 +3929,23 @@ class NetGateApp(tk.Tk):
             if self.sort_key == "acces":
                 # en attente, puis autorises, puis bloques
                 return ({None: 0, True: 1, False: 2}[allowed], -conso_of(path))
+            if self.sort_key == "file":
+                return (os.path.basename(path), path)
             if self.sort_key == "path":
                 return path
-            return self.label_for(path).lower()
+            return noms[path].lower()
 
         rows = sorted(entries.items(), key=key_of, reverse=self.sort_desc)
 
         # rappel visuel de la colonne de tri
-        libelles = {"app": "Application", "acces": "Acces", "conso": "Consomme",
-                    "path": "Emplacement"}
+        libelles = {"app": "Application", "file": "Fichier", "acces": "Acces",
+                    "conso": "Consomme", "path": "Emplacement"}
         fleche = " v" if self.sort_desc else " ^"
         for c, t in libelles.items():
             self.tv_apps.heading(c, text=t + (fleche if c == self.sort_key else ""))
 
         for path, allowed in rows:
             conso = conso_of(path)
-            name = self.label_for(path)
             if allowed is None:
                 etat, tag = "en attente", "wait"
             elif allowed:
@@ -3132,10 +3953,12 @@ class NetGateApp(tk.Tk):
             else:
                 etat, tag = "bloque", "block"
             self.tv_apps.insert("", "end", tags=(tag,),
-                                values=(name, etat, fmt_bytes(conso), path))
+                                values=(noms[path], os.path.basename(path), etat,
+                                        fmt_bytes(conso), os.path.dirname(path) or "-",
+                                        path))
         if selval:
             for iid in self.tv_apps.get_children():
-                if self.tv_apps.item(iid, "values")[3] == selval:
+                if self.tv_apps.item(iid, "values")[5] == selval:
                     self.tv_apps.selection_set(iid)
                     break
 
@@ -3157,8 +3980,15 @@ class NetGateApp(tk.Tk):
                 item = self.pending_q.get_nowait()
             except queue.Empty:
                 break
-            self.pending.append(item)
-            new = True
+            try:
+                new = self._on_scanned(item) or new
+            except Exception:
+                log_error("traitement d'une detection")
+        while True:
+            try:
+                self.status(self._fw_msgs.get_nowait())
+            except queue.Empty:
+                break
         if new:
             self.refresh_pending_label()
             self.refresh_apps()
@@ -3167,50 +3997,143 @@ class NetGateApp(tk.Tk):
         self.after(500, self._loop_fast)
 
     def _loop_slow(self):
+        """Chaque seconde : comptage, puis coupure des que l'enveloppe se
+        vide. Affichage et sauvegarde suivent toutes les deux secondes. Une
+        erreur ne doit jamais arreter la boucle : c'est elle qui coupe."""
         sm = self.state_mgr
-        if sm.roll_period_if_needed():
-            self.status("Nouvelle journee - compteurs remis a zero")
-            self.tray.notify(APP_NAME, "Nouvelle enveloppe : %d Mo disponibles."
-                             % sm.data["quota_mb"])
-        acc = self.meter.drain()
+        self._tick += 1
+        try:
+            if sm.roll_period_if_needed():
+                self._icon_sig = None
+                self.status("Nouvelle journee - compteurs remis a zero")
+                self.tray.notify(APP_NAME, "Nouvelle enveloppe : %d Mo disponibles."
+                                 % sm.data["quota_mb"])
+            if self._tick % 30 == 0:
+                self._refresh_addresses()
+            self._account()
+            self._check_cut()
+            self.check_alerts()
+            if self._tick % 2 == 0:
+                if self.state().lower() != "withdrawn":
+                    self.refresh_all()
+                self.refresh_window_icon()
+                self.tray.refresh()
+                sm.save()
+        except Exception:
+            # une meme erreur a chaque seconde ne doit pas remplir le journal
+            trace = traceback.format_exc()
+            if trace != self._derniere_erreur:
+                self._derniere_erreur = trace
+                log_error("boucle de comptage")
+        self.after(1000, self._loop_slow)
+
+    # ---------------------------------------------------------- comptage
+    def _nic_counted(self, it):
+        """Une carte entame-t-elle l'enveloppe ? Physique par defaut, sauf
+        choix contraire dans les reglages."""
+        d = self.state_mgr.data
+        if it["guid"] in d.get("nic_include", []):
+            return True
+        return it["physique"] and it["guid"] not in d.get("nic_exclude", [])
+
+    def _counted_names(self, connectees=False):
+        return [it["alias"] for it in self.nic.ifaces
+                if self._nic_counted(it) and (it["up"] or not connectees)]
+
+    def _refresh_addresses(self):
+        """Adresses de la machine, pour que le comptage par programme separe
+        localhost, reseau local et Internet."""
+        if psutil is None:
+            return
+        try:
+            cartes = psutil.net_if_addrs()
+        except Exception:
+            return
+        comptees = set(self._counted_names())
+        own, counted, prefixes = {"127.0.0.1", "::1"}, set(), set()
+        for nom, addrs in cartes.items():
+            for a in addrs:
+                if a.family not in (socket.AF_INET, socket.AF_INET6):
+                    continue
+                try:
+                    ip = ipaddress.ip_address(a.address.split("%")[0])
+                except ValueError:
+                    continue
+                own.add(str(ip))
+                if nom in comptees:
+                    counted.add(str(ip))
+                if ip.version == 6 and (int(ip) >> 125) == 1:     # 2000::/3
+                    prefixes.add(int(ip) >> 64)
+        self.meter.set_addresses(frozenset(own), frozenset(counted), frozenset(prefixes))
+
+    def _account(self):
+        """Releve d'une seconde. Le detail par programme vient d'ETW (trafic
+        Internet seulement) ; l'enveloppe vient des compteurs des cartes
+        decomptees, moins le reseau local qu'ETW y a vu passer."""
+        sm = self.state_mgr
         now = time.time()
         dt = max(0.5, now - self._last_tick)
         self._last_tick = now
-        tick = {}
-        if acc:
-            for pid, (s, r) in acc.items():
-                if pid == 0:
-                    path = "(ensemble du systeme)"
-                else:
-                    path = (self.scanner.exe_for(pid) if psutil else None) or "(pid %s)" % pid
-                sm.add_usage(path, s, r, label=self.label_for(path),
-                             compte=bool(sm.data["engaged"]))
-                tick[path.lower()] = tick.get(path.lower(), 0) + s + r
-        self.rates = {p: v / dt for p, v in tick.items()}
-        ouvert = sm.schedule_open()
-        if ouvert != self._slot_state:
-            if self._slot_state is not None:
-                suite = sm.schedule_next_change()
-                if ouvert:
-                    msg = "Plage horaire ouverte : Internet retabli"
-                else:
-                    msg = "Plage horaire fermee : Internet coupe"
-                if suite:
-                    msg += " jusqu'a %s" % suite[1]
-                self.status(msg)
-                self.tray.notify(APP_NAME, msg)
-                log_line(msg)
-            self._slot_state = ouvert
-            if sm.data["engaged"]:
-                self.apply_firewall()
+        etw = self.meter.drain()
 
-        self.check_alerts()
-        if self.state().lower() != "withdrawn":
-            self.refresh_all()
-        self.refresh_window_icon()
-        self.tray.refresh()
-        sm.save()
-        self.after(2000, self._loop_slow)
+        tick = {}
+        for pid, (s, r) in etw["apps"].items():
+            exe = self.scanner.exe_for(pid) if psutil else None
+            # app_key seul, sans ranger le chemin : c'est au scanner de
+            # signaler une nouvelle version, pour que ses regles suivent
+            key = app_key(exe) if exe else UNATTRIBUTED
+            sm.add_app_usage(key, s, r, label=self.label_for(key))
+            tick[key] = tick.get(key, 0) + s + r
+        self.rates = {k: v / dt for k, v in tick.items()}
+
+        nic = self.nic.poll(self._nic_counted)
+        if nic is not None and any(self._nic_counted(it) for it in self.nic.ifaces):
+            s, r = nic
+            # les evenements ETW arrivent par paquets : ce qui n'a pas pu
+            # etre retire ce tour-ci l'est au suivant, pas au-dela
+            ls, lr = etw["lan"][0] + self._lan_reste[0], etw["lan"][1] + self._lan_reste[1]
+            ms, mr = min(s, ls), min(r, lr)
+            self._lan_reste = [min(ls - ms, etw["lan"][0]), min(lr - mr, etw["lan"][1])]
+            s, r = s - ms, r - mr
+            self.env_source = "carte"
+        elif self.meter.mode == "etw":
+            s, r = etw["inet"]
+            self.env_source = "etw"
+        else:
+            s = r = 0
+            self.env_source = None
+        if s or r:
+            sm.add_total(s, r, compte=bool(sm.data["engaged"]))
+        sm.data["usage"]["local"] = sm.data["usage"].get("local", 0) + etw["local"]
+        self.rate_total = (s + r) / dt
+
+    def _check_cut(self):
+        """Suit la raison de couper Internet ; au changement, previent et
+        met le pare-feu a jour. Protection inactive, rien n'est coupe."""
+        sm = self.state_mgr
+        raison = sm.cut_reason()
+        if raison == self._cut_state:
+            return
+        avant, self._cut_state = self._cut_state, raison
+        if not sm.data["engaged"]:
+            return
+        if avant != "?":
+            if raison == "plage":
+                suite = sm.schedule_next_change()
+                msg = "Plage horaire fermee : Internet coupe" + (
+                    " jusqu'a %s" % suite[1] if suite else "")
+            elif raison == "enveloppe":
+                msg = ("Enveloppe epuisee : Internet coupe jusqu'a la remise a zero "
+                       "de %02d:%02d. Rallonge possible depuis la fenetre ou l'icone."
+                       % (sm.data["reset_hh"], sm.data["reset_mm"]))
+            elif avant == "plage":
+                msg = "Plage horaire ouverte : Internet retabli"
+            else:
+                msg = "Enveloppe renouvelee : Internet retabli"
+            self.status(msg)
+            self.tray.notify(APP_NAME, msg)
+            log_line(msg)
+        self.apply_firewall()
 
     def check_alerts(self):
         sm = self.state_mgr
@@ -3218,12 +4141,19 @@ class NetGateApp(tk.Tk):
         for seuil in sorted(sm.data["alert_pct"]):
             if pct >= seuil and seuil not in sm.data["alerts_fired"]:
                 sm.data["alerts_fired"].append(seuil)
-                msg = ("%d %% de l'enveloppe consommes (%s sur %d Mo). "
-                       "Rien n'est coupe." % (seuil, fmt_bytes(sm.total_used()),
-                                              sm.data["quota_mb"]))
-                self.tray.notify(APP_NAME, msg)
+                coupe = (seuil >= 100 and sm.data["engaged"]
+                         and sm.data.get("quota_cut", True))
+                msg = ("%d %% de l'enveloppe consommes (%s sur %s). %s"
+                       % (seuil, fmt_bytes(sm.total_used()), fmt_bytes(sm.quota_bytes()),
+                          "Internet est coupe jusqu'a la remise a zero ; une rallonge "
+                          "reste possible." if coupe else "Rien n'est coupe."))
+                if not coupe:       # la coupure a deja fait sa notification
+                    self.tray.notify(APP_NAME, msg)
                 if self.state().lower() != "withdrawn":
-                    messagebox.showwarning("Enveloppe Internet", msg)
+                    # differe : la boucle de comptage n'attend pas qu'on ferme
+                    # la boite pour continuer a compter
+                    self.after(10, lambda m=msg: messagebox.showwarning(
+                        "Enveloppe Internet", m, parent=self))
 
     def _startup_checks(self):
         missing = []
@@ -3239,7 +4169,8 @@ class NetGateApp(tk.Tk):
                 "Il manque : %s\n\nOuvre l'invite de commandes et tape :\n"
                 "    pip install %s\n\n"
                 "Sans psutil : aucune detection des programmes.\n"
-                "Sans pywintrace : comptage global au lieu du detail par application.\n"
+                "Sans pywintrace : pas de detail par programme (l'enveloppe reste "
+                "mesuree sur la carte reseau).\n"
                 "Sans pystray/pillow : pas d'icone dans la zone de notification."
                 % (", ".join(missing), " ".join(missing)))
         if getattr(self, "_roll_au_demarrage", False):

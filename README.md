@@ -6,19 +6,20 @@
 
 Le robinet Internet est fermé ; vous l'ouvrez programme par programme.
 NetGate compte ce que chacun consomme, vous prévient quand l'enveloppe du
-jour s'épuise, et ne coupe jamais rien de lui-même.
+jour s'épuise, et coupe Internet quand elle est vide.
 
 **À qui ça sert.** À quiconque vit sur une connexion comptée — partage de
 connexion mobile, clé 4G, forfait data limité, liaison satellite — où chaque
 mégaoctet a de la valeur et où une mise à jour lancée au mauvais moment peut
 vider un forfait en une heure. NetGate pilote le pare-feu Windows pour
 bloquer tout le trafic sortant, vous demande quoi faire dès qu'un programme
-tente de sortir, attribue chaque octet envoyé ou reçu au programme qui l'a
-produit, et tient une enveloppe journalière avec alertes à 50, 80 et 100 %.
-Il produit une liste d'autorisations qui vous survit d'un lancement à
-l'autre, un compteur par programme et par jour, et un blason dans la zone
-de notification qui se remplit avec votre consommation. Version actuelle :
-1.3.
+tente de sortir, mesure l'enveloppe sur la carte réseau par laquelle
+passent les données, attribue à chaque programme ce qu'il échange avec
+Internet, et tient une enveloppe journalière avec alertes à 50, 80 et 100 %
+et coupure à 100 %. Il produit une liste d'autorisations qui vous survit
+d'un lancement à l'autre, un compteur par programme et par jour, et un
+blason dans la zone de notification qui se remplit avec votre
+consommation. Version actuelle : 1.4.
 
 Python 3.8+ avec tkinter, `psutil`, `pywintrace`, `pystray` et `pillow` —
 Windows 10 ou 11, droits administrateur.
@@ -62,8 +63,8 @@ vous puissiez décider en connaissance de cause.
 
 | Bibliothèque | Ce qu'elle apporte | Sans elle |
 |---|---|---|
-| `psutil` | découverte des connexions ouvertes, comptage de repli | aucun programme n'est détecté, aucune notification n'apparaît |
-| `pywintrace` | comptage par programme (Event Tracing for Windows) | le compteur affiche un total « global estimé », sans détail par programme |
+| `psutil` | découverte des connexions ouvertes, adresses des cartes réseau | aucun programme n'est détecté, aucune notification n'apparaît |
+| `pywintrace` | comptage par programme (Event Tracing for Windows) | l'enveloppe reste mesurée sur la carte réseau, sans détail par programme |
 | `pystray` + `pillow` | l'icône dans la zone de notification et son menu | la fenêtre principale reste seule, sans blason près de l'horloge |
 
 ### Les droits administrateur
@@ -93,7 +94,8 @@ sections :
 | Section | Rôle |
 |---|---|
 | `Firewall` | génère et exécute les scripts `netsh advfirewall` |
-| `EtwMeter` | écoute le fournisseur Kernel-Network et attribue les octets à chaque processus |
+| `EtwMeter` | écoute le fournisseur Kernel-Network et attribue à chaque processus ses octets échangés avec Internet |
+| `NicMeter` | lit les compteurs des cartes réseau : la mesure de l'enveloppe |
 | `ConnScanner` | découvre les connexions ouvertes et signale les programmes sans décision |
 | `State` | charge et sauvegarde le fichier d'état, gère les périodes et les profils |
 | `Inspector` | répond à « qui est ce programme ? » |
@@ -169,11 +171,24 @@ sécurité* → *Règles de trafic sortant* est exactement ce qui s'applique.
 
 **Le blocage.** Quand la protection est active, la politique sortante des
 trois profils réseau (domaine, privé, public) passe à *bloquer*, puis une
-règle *autoriser* est créée par programme accepté. Toutes les règles de
-NetGate portent le préfixe `NETGATE_` ; les règles tierces ne sont jamais
-touchées. Les modifications sont regroupées dans un script `netsh -f`
-exécuté en une fois, parce que chaque appel `netsh` isolé coûte environ
-200 ms et figerait l'interface.
+règle *autoriser* est créée par programme accepté et une règle *bloquer*
+par programme refusé. Toutes les règles de NetGate portent le préfixe
+`NETGATE_` ; les règles tierces ne sont jamais touchées. Les modifications
+sont regroupées dans un script `netsh -f` exécuté en une fois, parce que
+chaque appel `netsh` isolé coûte environ 200 ms et figerait l'interface.
+
+**Pourquoi des règles de blocage.** Windows et de nombreux logiciels posent
+leurs propres règles *autoriser* dans le pare-feu : applications du Store,
+services Windows, certains installateurs (plus d'une centaine sur un poste
+courant). Ces règles laissent passer leur programme malgré la politique
+*bloquer*. Une règle de blocage, elle, l'emporte toujours sur une règle
+d'autorisation : c'est ce qui rend *Bloquer* effectif, et ce qui rend la
+coupure (enveloppe épuisée, hors plage horaire) étanche. Ces règles ne
+visent que les adresses Internet : localhost et le réseau local restent
+ouverts. Exception : `svchost.exe` n'en reçoit jamais, car elle
+l'emporterait aussi sur la règle DNS/DHCP. Un programme encore en attente
+de réponse peut, lui, profiter d'une autorisation posée par Windows ou son
+installateur.
 
 **La règle DNS/DHCP « essentiels ».** Une règle facultative, cochée par
 défaut, laisse passer `svchost.exe` sur les ports 53 (DNS) et 67-68 (DHCP).
@@ -181,17 +196,38 @@ Sans elle, même les programmes autorisés ne résolvent plus aucun nom et
 tout semble bloqué. Si tout se met à échouer, c'est le premier réglage à
 vérifier.
 
-**Le comptage.** NetGate s'abonne au fournisseur
-`Microsoft-Windows-Kernel-Network` (Event Tracing for Windows) pour
-attribuer chaque octet envoyé ou reçu au processus qui l'a produit. Si
-`pywintrace` manque ou si la session ETW ne peut pas démarrer, il se replie
-sur un total global mesuré par `psutil.net_io_counters()`, signalé comme
-« global estimé » pour que vous sachiez que le détail par programme n'est
-pas disponible.
+**Le comptage de l'enveloppe.** L'enveloppe est mesurée sur la carte
+réseau par laquelle passent les données (Wi-Fi, Ethernet, clé 4G, partage
+de connexion USB ou Bluetooth), avec les compteurs que montre le
+Gestionnaire des tâches : c'est la mesure la plus proche de celle de
+l'opérateur, en-têtes compris, trafic des machines virtuelles compris. Ce
+qui reste dans le PC n'y passe pas : un serveur WAMP, MySQL ou PHP
+interrogé en localhost ne coûte rien. Le trafic avec le réseau local (NAS,
+imprimante, autre PC) est retiré du compte. Les cartes virtuelles (tunnel
+VPN, VirtualBox, Hyper-V) ne sont pas comptées : elles relaient un trafic
+qui sort ensuite par la carte physique, les compter le décompterait deux
+fois. Réglages → *Cartes décomptées* pour changer ce choix.
 
-**La découverte.** Toutes les 1,5 s, la liste des connexions ouvertes est
-relevée et chaque exécutable qui n'a pas encore reçu de décision déclenche
-une carte de demande.
+**Le détail par programme.** NetGate s'abonne au fournisseur
+`Microsoft-Windows-Kernel-Network` (Event Tracing for Windows) pour
+attribuer à chaque processus les octets qu'il échange avec Internet ;
+chaque événement porte les deux adresses de la connexion, ce qui permet
+d'écarter localhost et le réseau local. Si `pywintrace` manque ou si la
+session ETW ne peut pas démarrer, l'enveloppe reste mesurée sur la carte,
+sans détail par programme. Avec un VPN, le programme et le VPN comptent
+chacun leur part : la somme de la liste peut dépasser l'enveloppe, qui
+reste juste.
+
+**La découverte.** Toutes les 1,5 s, la liste des connexions ouvertes vers
+Internet est relevée et chaque exécutable qui n'a pas encore reçu de
+décision déclenche une carte de demande. Un programme qui ne parle qu'à
+localhost ou au réseau local ne déclenche rien.
+
+**Les mises à jour.** Beaucoup de programmes changent de dossier à chaque
+version (`claude_2.110…`, `app-1.0.9187`, `152.0.4191.66`). NetGate les
+reconnaît : une seule ligne dans la liste, dont l'emplacement porte `*` à
+la place du numéro de version, et la décision suit la nouvelle version,
+règle du pare-feu comprise, sans reposer la question.
 
 **L'inspecteur.** Pour répondre à « qui est ce programme ? », NetGate
 combine un glossaire en français des processus courants, la version et
@@ -230,7 +266,9 @@ fichier personnel, ne le partagez pas tel quel.
 
 Vert = autorisé, rouge = bloqué, orange = en attente. Les colonnes se trient
 (accès, volume), un double-clic change la décision, et la fiche descriptive
-en bas de fenêtre rappelle qui est le programme sélectionné. *Ajouter un
+en bas de fenêtre rappelle qui est le programme sélectionné. La colonne
+*Fichier* montre l'exécutable : `firefox.exe` et `pingsender.exe` sont deux
+programmes distincts du même logiciel, chacun avec sa décision. *Ajouter un
 programme* autorise quelque chose à l'avance, sans attendre qu'il se
 manifeste — utile pour un logiciel de visioconférence juste avant une
 réunion.
@@ -244,24 +282,34 @@ réunion.
   locale ou UTC. Si l'ordinateur est éteint à ce moment-là, la bascule se
   fait au démarrage suivant ; si l'horloge du système a reculé, la bascule
   est forcée pour ne pas prolonger indûment la journée.
-- Alertes à 50, 80 et 100 % : NetGate prévient, il ne coupe jamais. Couper
-  serait décider à votre place ; la décision reste la vôtre.
+- Alertes à 50, 80 et 100 %. À 100 %, **Internet est coupé** jusqu'à la
+  remise à zéro : une seule règle de blocage vers toutes les adresses
+  Internet, qui passe devant toutes les autorisations, celles de NetGate
+  comme celles déjà posées dans Windows. Localhost et le réseau local
+  restent ouverts. La coupure intervient dans la seconde ; quelques Mo
+  peuvent encore passer pendant ce délai.
+- *Rallonge pour aujourd'hui*, dans le bandeau ou le menu de l'icône
+  pendant la coupure, ajoute des Mo pour la période en cours seulement :
+  le réglage de l'enveloppe ne change pas.
+- Pour être seulement prévenu, sans coupure : Réglages → décocher *Couper
+  Internet quand l'enveloppe est épuisée*.
 - *Remettre le compteur à zéro*, dans les réglages, repart de zéro sans
   toucher aux autorisations.
 
 ### Les plages horaires
 
 Réglages → *Plages horaires* : un tableau de 48 demi-heures à cocher. Hors
-plage, plus rien ne sort, même les programmes autorisés. Raccourcis *tout
-ouvrir*, *tout fermer*, *08h-22h*. Le bandeau indique la prochaine ouverture
-ou fermeture, pour que vous ne cherchiez pas pourquoi tout s'est arrêté à
-22 h.
+plage, plus rien ne sort vers Internet, même les programmes autorisés, quel
+que soit le profil ; localhost et le réseau local restent ouverts.
+Raccourcis *tout ouvrir*, *tout fermer*, *08h-22h*. Le bandeau indique la
+prochaine ouverture ou fermeture, pour que vous ne cherchiez pas pourquoi
+tout s'est arrêté à 22 h.
 
 ### L'icône près de l'horloge
 
 Le blason se remplit avec la consommation (vert → orange → rouge). Clic
-droit : *Ouvrir*, choix du profil, Mo restants, *Tout débloquer (PANIQUE)*,
-*Quitter*.
+droit : *Ouvrir*, choix du profil, Mo restants, *Rallonge* pendant une
+coupure, *Tout débloquer (PANIQUE)*, *Quitter*.
 
 ### Les profils
 
@@ -340,16 +388,28 @@ de noms, aucun programme ne sait où aller.
 pour voir l'erreur, ou ouvrez `netgate.log` à côté de `netgate.py` (ou dans
 `%APPDATA%\NetGate`).
 
-**Le compteur indique « global estimé »** — `pywintrace` n'est pas installé
-ou la session ETW n'a pas pu démarrer. Le total reste juste, le détail par
-programme n'est pas disponible.
+**Le bandeau indique « sans détail par programme »** — `pywintrace` n'est
+pas installé, ou la session ETW n'a pas pu démarrer (droits administrateur
+refusés). L'enveloppe reste mesurée sur la carte réseau ; seul le détail
+par programme manque.
+
+**Un programme bloqué passe quand même** — il est sans doute encore *en
+attente* et profite d'une autorisation que Windows ou son installateur a
+posée. Répondez *Bloquer* : la règle de blocage l'emporte sur toutes les
+autorisations.
 
 **Internet est resté bloqué après un plantage** — relancez NetGate (il
 nettoie ses règles au démarrage), ou cliquez **PANIQUE**. En dernier
-recours, dans un PowerShell administrateur :
+recours, dans un PowerShell administrateur, la première commande rétablit
+la politique sortante d'origine, la seconde supprime toutes les règles
+`NETGATE_`, dont la coupure :
 
 ```powershell
 netsh advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound
+```
+
+```powershell
+Remove-NetFirewallRule -DisplayName "NETGATE_*"
 ```
 
 **Configuration corrompue** — renommez `netgate.state.json` et relancez.
