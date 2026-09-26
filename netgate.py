@@ -62,6 +62,11 @@ V2.0  Moteur de filtrage NetGate : les filtres vivent dans la Windows
       (evenement TCPIP 1020) : carte de demande meme pour un programme qui
       n'a jamais reussi a sortir. Repli automatique sur le pare-feu Windows.
       Autotest sans risque : python netgate.py --test-wfp.
+V2.1  Comptage par programme retabli : abonnement a Kernel-Network avec tous
+      les mots-cles, detection des refus dans une session a part, sessions
+      ETW recreees au lieu d'etre reprises en silence, et fermees en
+      quittant. Le bandeau signale une ecoute qui ne recoit rien ; l'autotest
+      controle le comptage de bout en bout.
 """
 
 import contextlib
@@ -129,7 +134,7 @@ ANNEE = "2026"
 # Numerotation : V<majeure>.<mineure>, plus une lettre pour une retouche
 # mineure (V1.1a). La majeure change en cas de refonte, la mineure a chaque
 # ajout ou correction, la lettre pour un ajustement cosmetique.
-VERSION = "2.0"
+VERSION = "2.1"
 
 VERSION_TXT = "V" + VERSION
 COPYRIGHT = "%s \u00a9 %s" % (AUTEUR, ANNEE)
@@ -1163,15 +1168,18 @@ class EtwMeter(threading.Thread):
     est mis de cote au lieu d'etre impute aux programmes."""
     daemon = True
 
-    def __init__(self):
+    def __init__(self, session=ETW_SESSION):
         super().__init__(name="EtwMeter")
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._reset_acc()
+        self.session = session
         self.mode = "init"
         self.error = ""
-        self.detection = False      # evenement 1020 recu : refus visibles
-        self._job = None
+        self.detection = False      # session des refus ouverte
+        self.recus = 0              # evenements d'envoi/reception recus
+        self.lus = 0                # ... dont le processus et la taille sont lisibles
+        self._jobs = []
         self._scopes = {}
         self.own = frozenset(("127.0.0.1", "::1"))
         self.counted = frozenset()
@@ -1259,10 +1267,12 @@ class EtwMeter(threading.Thread):
         sens = 0 if event_id in ETW_SENT_IDS else 1
         if sens == 1 and event_id not in ETW_RECV_IDS:
             return
+        self.recus += 1
         pid = self._pick(payload, ("PID", "pid", "ProcessId"))
         size = self._pick(payload, ("size", "Size", "TransferSize", "DataLength"))
         if pid is None or not size or size <= 0:
             return
+        self.lus += 1
         a, b = payload.get("saddr"), payload.get("daddr")
         sa, ca = self._scope(a) if a else ("internet", "")
         sb, cb = self._scope(b) if b else ("internet", "")
@@ -1289,48 +1299,73 @@ class EtwMeter(threading.Thread):
         except Exception:
             pass
 
+    def _ouvrir(self, nom, providers, ids):
+        """Ouvre une session ETW neuve. Une session du meme nom laissee par un
+        arret brutal est d'abord arretee : s'y raccrocher (ce que pywintrace
+        fait sans rien dire) garderait ses anciens abonnements, ou aucun."""
+        erreur = None
+        for essai in range(3):
+            self._arreter_session(nom)
+            time.sleep(0.3 * essai)
+            try:
+                try:
+                    job = _etw.ETW(session_name=nom, providers=providers,
+                                   event_callback=self._callback,
+                                   event_id_filters=ids, ignore_exists_error=False)
+                except TypeError:       # pywintrace trop ancien pour ces options
+                    job = _etw.ETW(providers=providers, event_callback=self._callback)
+                job.start()
+                return job
+            except Exception as e:
+                erreur = e
+        self._arreter_session(nom)       # rien a moitie ouvert ne doit rester
+        raise erreur
+
     def run(self):
         if _etw is None or _GUID is None:
             self.mode, self.error = "off", "pywintrace absent"
             return
-        self._arreter_session(ETW_SESSION)
-        compteur = _etw.ProviderInfo("Microsoft-Windows-Kernel-Network",
-                                     _GUID(KERNEL_NETWORK_GUID))
-        # les evenements hors envoi, reception et refus ne sont meme pas decodes
-        ids = sorted(ETW_SENT_IDS | ETW_RECV_IDS | {TCPIP_CONNECT_BLOCKED})
-        essais = [[compteur]]
+        # comptage : Kernel-Network, avec tous les mots-cles. Ses evenements
+        # d'envoi et de reception ne portent que le bit de leur canal : un
+        # masque vide peut ne rien laisser passer du tout.
         try:
-            essais.insert(0, [compteur, _etw.ProviderInfo(
-                "Microsoft-Windows-TCPIP", _GUID(TCPIP_GUID), level=TCPIP_LEVEL,
-                any_keywords=TCPIP_KW_CONNECTPATH)])
-        except Exception:
-            pass
-        for providers in essais:
-            try:
-                try:
-                    self._job = _etw.ETW(session_name=ETW_SESSION, providers=providers,
-                                         event_callback=self._callback,
-                                         event_id_filters=ids)
-                except TypeError:       # pywintrace trop ancien pour ces options
-                    self._job = _etw.ETW(providers=providers,
-                                         event_callback=self._callback)
-                self._job.start()
-                self.mode = "etw"
-                self.detection = len(providers) > 1
-                break
-            except Exception as e:
-                self.mode, self.error = "off", str(e)
-                self._arreter_session(ETW_SESSION)
-        if self.mode != "etw":
-            log_line("comptage par programme indisponible : %s" % self.error)
+            self._jobs.append(self._ouvrir(
+                self.session,
+                [_etw.ProviderInfo("Microsoft-Windows-Kernel-Network",
+                                   _GUID(KERNEL_NETWORK_GUID),
+                                   any_keywords=0xFFFFFFFFFFFFFFFF)],
+                sorted(ETW_SENT_IDS | ETW_RECV_IDS)))
+            self.mode = "etw"
+        except Exception as e:
+            self.mode, self.error = "off", str(e)
+            log_line("comptage par programme indisponible : %s" % e)
+        # detection des refus : TCPIP, dans sa propre session, pour ne jamais
+        # gener le comptage
+        try:
+            self._jobs.append(self._ouvrir(
+                self.session + "-Refus",
+                [_etw.ProviderInfo("Microsoft-Windows-TCPIP", _GUID(TCPIP_GUID),
+                                   level=TCPIP_LEVEL, any_keywords=TCPIP_KW_CONNECTPATH)],
+                [TCPIP_CONNECT_BLOCKED]))
+            self.detection = True
+        except Exception as e:
+            log_line("detection des connexions refusees indisponible : %s" % e)
+        if not self._jobs:
             return
-        if not self.detection:
-            log_line("detection des connexions refusees indisponible")
         self._stop.wait()
-        try:
-            self._job.stop()
-        except Exception:
-            pass
+        for job in self._jobs:
+            try:
+                job.stop()
+            except Exception:
+                pass
+        self._jobs = []
+
+    def arret(self, delai=3.0):
+        """Arrete les sessions ETW et attend qu'elles soient fermees : une
+        session oubliee continuerait de tourner sans lecteur."""
+        self._stop.set()
+        if self.is_alive():
+            self.join(delai)
 
 
 # ==========================================================================
@@ -2909,6 +2944,9 @@ HELP = [
           "Le bandeau indique \"sans detail par programme\" : le module pywintrace "
           "n'est pas installe, ou NetGate tourne sans droits administrateur. "
           "L'enveloppe reste mesuree sur la carte reseau.\n"
+          "Le bandeau indique \"detail par programme : aucun evenement recu\" : "
+          "la carte voit du trafic mais l'ecoute par programme ne recoit rien. "
+          "L'enveloppe reste juste ; lance l'autotest, qui controle ce comptage.\n"
           "Le bandeau indique \"filtrage : pare-feu Windows (repli)\" : le moteur "
           "NetGate n'a pas pu s'ouvrir, la raison est dans Reglages et dans "
           "netgate.log. Un autre NetGate tourne peut-etre deja.\n"
@@ -2956,6 +2994,8 @@ class NetGateApp(tk.Tk):
         self._last_tick = time.time()
         self._tick = 0
         self._derniere_erreur = ""
+        self._octets_carte = 0    # vu par les cartes depuis le lancement
+        self._silence_signale = False
 
         self.meter = EtwMeter()
         self.nic = NicMeter()
@@ -3300,7 +3340,7 @@ class NetGateApp(tk.Tk):
         except Exception:
             log_error("nettoyage du pare-feu a la fermeture")
         self.state_mgr.save()
-        self.meter.stop()
+        self.meter.arret()          # sessions ETW fermees, pas abandonnees
         self.scanner.stop()
         self.tray.stop()
         self.destroy()
@@ -4522,8 +4562,18 @@ class NetGateApp(tk.Tk):
             lignes = ["enveloppe estimee programme par programme"]
         else:
             lignes = ["aucun comptage disponible"]
-        lignes.append("detail par programme" if self.meter.mode == "etw"
-                      else "sans detail par programme")
+        if self.meter.mode != "etw":
+            lignes.append("sans detail par programme")
+        elif self.meter.recus == 0 and self._octets_carte > 1024 * 1024:
+            # la carte voit passer du trafic, l'ecoute par programme rien :
+            # le dire plutot qu'afficher des zeros
+            lignes.append("detail par programme : aucun evenement recu")
+            if not self._silence_signale:
+                self._silence_signale = True
+                log_line("comptage par programme : aucun evenement recu alors que "
+                         "%s sont passes par la carte" % fmt_bytes(self._octets_carte))
+        else:
+            lignes.append("detail par programme")
         local = d["usage"].get("local", 0)
         if local:
             lignes.append("localhost et reseau local ecartes : %s" % fmt_bytes(local))
@@ -4756,6 +4806,7 @@ class NetGateApp(tk.Tk):
         nic = self.nic.poll(self._nic_counted)
         if nic is not None and any(self._nic_counted(it) for it in self.nic.ifaces):
             s, r = nic
+            self._octets_carte += s + r
             # les evenements ETW arrivent par paquets : ce qui n'a pas pu
             # etre retire ce tour-ci l'est au suivant, pas au-dela
             ls, lr = etw["lan"][0] + self._lan_reste[0], etw["lan"][1] + self._lan_reste[1]
@@ -5120,7 +5171,122 @@ def selftest_wfp():
 
     r = essai_connexion(TEST_ADRESSE)
     exige(r != "refuse", "session fermee : les filtres ont disparu d'eux-memes (%s)" % r)
+    try:
+        controle_comptage(note)
+    except Exception as e:
+        note("ATTENTION", "controle du comptage interrompu : %s" % e)
     return fin()
+
+
+def trafic_localhost(octets=512 * 1024):
+    """Echange des octets avec soi-meme sur localhost : du vrai trafic, qui
+    ne coute rien sur le forfait. Renvoie ce que le serveur a recu."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    srv.settimeout(5)
+    recu = [0]
+
+    def lire():
+        try:
+            c, _ = srv.accept()
+            c.settimeout(5)
+            while True:
+                d = c.recv(65536)
+                if not d:
+                    break
+                recu[0] += len(d)
+            c.close()
+        except OSError:
+            pass
+
+    t = threading.Thread(target=lire, daemon=True)
+    t.start()
+    cli = socket.create_connection(srv.getsockname(), timeout=5)
+    bloc = b"n" * 65536
+    for _ in range(max(1, octets // len(bloc))):
+        cli.sendall(bloc)
+    cli.close()
+    t.join(5)
+    srv.close()
+    # de l'UDP aussi : le TCP local peut passer par un raccourci de Windows
+    # ("fast loopback") qui echappe aux traces, pas l'UDP
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    v = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.bind(("127.0.0.1", 0))
+    u.settimeout(2)
+    for _ in range(32):
+        # un envoi, une lecture : envoyes d'affilee, les datagrammes
+        # deborderaient la memoire de reception et seraient perdus
+        v.sendto(b"u" * 8192, u.getsockname())
+        try:
+            recu[0] += len(u.recv(65536))
+        except OSError:
+            break
+    u.close()
+    v.close()
+    return recu[0]
+
+
+def controle_comptage(note):
+    """Le compteur par programme de NetGate, tel quel, sous un autre nom de
+    session : voit-il du trafic localhost emis par ce programme ? Sinon,
+    quelques reglages sont essayes pour dire lequel fonctionne ici."""
+    if _etw is None:
+        note("ATTENTION", "comptage par programme non teste : pywintrace absent de ce Python")
+        return
+    m = EtwMeter(session="NetGate-Test-Comptage")
+    m.start()
+    fin_attente = time.time() + 8
+    while m.mode == "init" and time.time() < fin_attente:
+        time.sleep(0.1)
+    if m.mode != "etw":
+        note("ATTENTION", "session de comptage impossible : %s" % m.error)
+        m.arret()
+        return
+    time.sleep(1.0)
+    envoye = trafic_localhost()
+    time.sleep(3.0)
+    d = m.drain()
+    m.arret()
+    vu, inet = d["local"], sum(d["inet"])
+    if vu or inet:
+        note("OK", "comptage par programme : les evenements arrivent (localhost %s pour "
+                   "%s echanges, Internet de tous les programmes %s)"
+             % (fmt_bytes(vu), fmt_bytes(envoye), fmt_bytes(inet)))
+        return
+    note("ATTENTION", "comptage par programme : rien vu (%d evenements recus, %d lisibles)"
+         % (m.recus, m.lus))
+    moi = os.getpid()
+    for nom, mots_cles, niveau in (("masque vide, niveau 4", 0, 4),
+                                   ("tous mots-cles, niveau 4", 0xFFFFFFFFFFFFFFFF, 4),
+                                   ("tous mots-cles, niveau 5", 0xFFFFFFFFFFFFFFFF, 5)):
+        compte = {"recus": 0, "moi": 0}
+
+        def rappel(ev, compte=compte):
+            if ev[0] in ETW_SENT_IDS | ETW_RECV_IDS:
+                compte["recus"] += 1
+                ch = ev[1] if isinstance(ev[1], dict) else {}
+                pid = EtwMeter._pick(ch, ("PID",)) or EtwMeter._pick(
+                    ch.get("EventHeader") or {}, ("ProcessId",))
+                if pid == moi:
+                    compte["moi"] += 1
+        try:
+            EtwMeter._arreter_session("NetGate-Test-Variante")
+            s = _etw.ETW(session_name="NetGate-Test-Variante", event_callback=rappel,
+                         providers=[_etw.ProviderInfo(
+                             "Microsoft-Windows-Kernel-Network", _GUID(KERNEL_NETWORK_GUID),
+                             level=niveau, any_keywords=mots_cles)])
+            s.start()
+            time.sleep(1.0)
+            trafic_localhost(256 * 1024)
+            time.sleep(3.0)
+            s.stop()
+            note("", "essai %s : %d evenements d'envoi/reception, dont %d de ce programme"
+                 % (nom, compte["recus"], compte["moi"]))
+        except Exception as e:
+            note("", "essai %s : impossible (%s)" % (nom, e))
+            EtwMeter._arreter_session("NetGate-Test-Variante")
 
 
 # ==========================================================================
