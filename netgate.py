@@ -5245,10 +5245,11 @@ def trafic_localhost(octets=512 * 1024):
 def controle_comptage(note):
     """Le compteur par programme de NetGate, tel quel, sous un autre nom de
     session : voit-il du trafic localhost emis par ce programme ? Sinon,
-    quelques reglages sont essayes pour dire lequel fonctionne ici."""
+    d'autres sources sont interrogees pour dire laquelle fonctionne ici."""
     if _etw is None:
         note("ATTENTION", "comptage par programme non teste : pywintrace absent de ce Python")
         return
+    note_ecoutes(note, "avant le controle")
     m = EtwMeter(session="NetGate-Test-Comptage")
     m.start()
     fin_attente = time.time() + 8
@@ -5271,36 +5272,234 @@ def controle_comptage(note):
         return
     note("ATTENTION", "comptage par programme : rien vu (%d evenements recus, %d lisibles)"
          % (m.recus, m.lus))
-    moi = os.getpid()
-    for nom, mots_cles, niveau in (("masque vide, niveau 4", 0, 4),
-                                   ("tous mots-cles, niveau 4", 0xFFFFFFFFFFFFFFFF, 4),
-                                   ("tous mots-cles, niveau 5", 0xFFFFFFFFFFFFFFFF, 5)):
-        compte = {"recus": 0, "moi": 0}
+    diagnostic_sources(note)
 
-        def rappel(ev, compte=compte):
-            if ev[0] in ETW_SENT_IDS | ETW_RECV_IDS:
-                compte["recus"] += 1
-                ch = ev[1] if isinstance(ev[1], dict) else {}
-                pid = EtwMeter._pick(ch, ("PID",)) or EtwMeter._pick(
-                    ch.get("EventHeader") or {}, ("ProcessId",))
-                if pid == moi:
-                    compte["moi"] += 1
+
+# Tracage reseau classique du noyau (SystemTraceProvider) : classes MOF des
+# evenements TcpIp et UdpIp, dont l'opcode donne le type (10 envoi, 11
+# reception, 26/27 en IPv6).
+FLAG_NETWORK_TCPIP = 0x00010000
+SYSTEM_TRACE_GUID = "{9E814AAD-3204-11D2-9A82-006008A86939}"
+CLASSE_TCPIP = "9A280AC0-C8E0-11D1-84E2-00C04FB998A2"
+CLASSE_UDPIP = "BF3A50C5-A9C9-4988-A005-2DF0B7C80F80"
+
+
+def trafic_test_internet():
+    """Du trafic qui sort vraiment de la machine : 16 datagrammes UDP vers
+    l'adresse de documentation 192.0.2.1 (perdus en route, sans reponse), et
+    quelques Ko en TCP si un equipement du chemin accepte la connexion."""
+    envoye = 0
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _ in range(16):
+            envoye += u.sendto(b"n" * 1024, TEST_ADRESSE)
+    except OSError:
+        pass
+    finally:
+        u.close()
+    try:
+        s = socket.create_connection(TEST_ADRESSE, timeout=1.5)
+    except OSError:
+        return envoye
+    try:
+        s.settimeout(2)
+        s.sendall(b"n" * 16 * 1024)
+        envoye += 16 * 1024
+    except OSError:
+        pass
+    finally:
+        s.close()
+    return envoye
+
+
+def sessions_etw():
+    """{numero: nom} des sessions ETW en cours (toutes, en administrateur)."""
+    from etw import evntrace as et
+    from etw.etw import TraceProperties
+    props = [TraceProperties() for _ in range(64)]
+    for p in props:
+        c = p.get().contents
+        c.LogFileNameOffset = c.LoggerNameOffset + 2 * 1024
+    tab = (ctypes.POINTER(et.EVENT_TRACE_PROPERTIES) * 64)(*[p.get() for p in props])
+    f = ctypes.WinDLL("advapi32").QueryAllTracesW
+    f.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+    f.restype = ctypes.c_ulong
+    n = ctypes.c_ulong(0)
+    if f(tab, 64, ctypes.byref(n)) not in (0, 234):     # 234 : plus de 64 sessions
+        return {}
+    noms = {}
+    for p in props[:min(n.value, 64)]:
+        c = p.get().contents
+        noms[c.Wnode.HistoricalContext & 0xFFFF] = ctypes.wstring_at(
+            ctypes.addressof(c) + c.LoggerNameOffset)
+    return noms
+
+
+def ecoutes_etw(guid):
+    """Sessions qui activent un fournisseur ETW : [(numero, niveau, mots-cles)],
+    None si Windows ne repond pas."""
+    import struct
+    f = ctypes.WinDLL("advapi32").EnumerateTraceGuidsEx
+    f.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
+                  ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+    f.restype = ctypes.c_ulong
+    g = _GUID(guid)
+    taille = ctypes.c_ulong(0)
+    f(1, ctypes.byref(g), 16, None, 0, ctypes.byref(taille))   # TraceGuidQueryInfo
+    if not taille.value:
+        return None
+    buf = ctypes.create_string_buffer(taille.value)
+    if f(1, ctypes.byref(g), 16, buf, taille.value, ctypes.byref(taille)):
+        return None
+    data = buf.raw[:taille.value]
+    vus, pos = {}, 8
+    # chaque inscription du fournisseur, suivie des sessions qui l'activent
+    for _ in range(struct.unpack_from("<I", data, 0)[0]):
+        suivant, nb = struct.unpack_from("<II", data, pos)
+        for k in range(nb):
+            _a, niveau, _r, numero, _p, _r2, mots = struct.unpack_from(
+                "<IBBHIIQ", data, pos + 16 + 32 * k)
+            vus[numero] = (niveau, mots)
+        if not suivant:
+            break
+        pos += suivant
+    return sorted((n, niv, mots) for n, (niv, mots) in vus.items())
+
+
+def note_ecoutes(note, quand):
+    """Qui ecoute Kernel-Network : une session oubliee s'y verrait."""
+    try:
+        ecoutes = ecoutes_etw(KERNEL_NETWORK_GUID)
+        noms = sessions_etw()
+    except Exception as e:
+        note("", "Kernel-Network %s : sessions illisibles (%s)" % (quand, e))
+        return
+    if ecoutes is None:
+        note("", "Kernel-Network %s : pas de reponse de Windows" % quand)
+        return
+    note("", "Kernel-Network %s : %s (%d sessions ETW en tout)" % (
+        quand, ", ".join("n.%d %s (niveau %d, mots-cles %x)"
+                         % (n, noms.get(n, "?"), niv, mots) for n, niv, mots in ecoutes)
+        or "aucune session ne l'ecoute", len(noms)))
+
+
+def _nom_source(guid):
+    g = str(guid).upper().strip("{}")
+    return {KERNEL_NETWORK_GUID.strip("{}"): "Kernel-Network",
+            TCPIP_GUID.strip("{}"): "TCPIP", CLASSE_TCPIP: "noyau TcpIp",
+            CLASSE_UDPIP: "noyau UdpIp"}.get(g, g[:8])
+
+
+def ecoute_diagnostic(nom, providers, properties=None, arreter=True):
+    """Quelques secondes de trafic de test sous une session ETW : evenements
+    recus par (source, id, opcode), pour tous les programmes et pour ce
+    programme, champs lisibles, et bilan de la session (tampons ecrits,
+    evenements perdus)."""
+    moi = os.getpid()
+    tous, miens, champs = {}, {}, {}
+
+    def rappel(ev):
         try:
-            EtwMeter._arreter_session("NetGate-Test-Variante")
-            s = _etw.ETW(session_name="NetGate-Test-Variante", event_callback=rappel,
-                         providers=[_etw.ProviderInfo(
-                             "Microsoft-Windows-Kernel-Network", _GUID(KERNEL_NETWORK_GUID),
-                             level=niveau, any_keywords=mots_cles)])
-            s.start()
-            time.sleep(1.0)
-            trafic_localhost(256 * 1024)
-            time.sleep(3.0)
+            ch = ev[1] if isinstance(ev[1], dict) else {}
+            ent = ch.get("EventHeader") or {}
+            d = ent.get("EventDescriptor") or {}
+            cle = (_nom_source(ent.get("ProviderId", "")), ev[0], d.get("Opcode"))
+            tous[cle] = tous.get(cle, 0) + 1
+            champs.setdefault(cle, sorted(k for k in ch if k not in (
+                "EventHeader", "Description", "Task Name", "EventExtendedData")))
+            pid = (EtwMeter._pick(ch, ("PID", "ProcessId", "Pid"))
+                   or EtwMeter._pick(ent, ("ProcessId",)))
+            if pid == moi:
+                miens[cle] = miens.get(cle, 0) + 1
+        except Exception:
+            pass
+
+    if arreter:
+        EtwMeter._arreter_session(nom)
+    s = _etw.ETW(session_name=nom, providers=providers, properties=properties,
+                 event_callback=rappel, ignore_exists_error=False)
+    try:
+        s.start()
+    except Exception:
+        # demarree mais sans source ou sans lecteur : ne pas la laisser
+        # tourner (jamais celle d'un autre programme, qu'on n'a pas demarree)
+        p = s.provider
+        if arreter or (p is not None and p.session_handle.value
+                       and not getattr(p, "kernel_trace_was_running", False)):
+            EtwMeter._arreter_session(nom)
+        raise
+    bilan = None
+    try:
+        time.sleep(1.0)
+        trafic_localhost(256 * 1024)
+        trafic_test_internet()
+        time.sleep(3.0)
+        try:
+            q = s.query()
+            bilan = (q.BuffersWritten, q.EventsLost, q.RealTimeBuffersLost)
+        except Exception:
+            pass
+    finally:
+        try:
             s.stop()
-            note("", "essai %s : %d evenements d'envoi/reception, dont %d de ce programme"
-                 % (nom, compte["recus"], compte["moi"]))
+        except Exception:
+            EtwMeter._arreter_session(nom)
+    return tous, miens, champs, bilan
+
+
+def diagnostic_sources(note):
+    """Kernel-Network ne livre rien : d'ou d'autre obtenir les octets de
+    chaque programme ? Trois sources, rapportees dans l'autotest."""
+    from etw import evntrace as et
+    from etw.etw import TraceProperties
+    noyau = TraceProperties()
+    noyau.get().contents.Wnode.Guid = _GUID("{%s}" % uuid.uuid4())
+    noyau.get().contents.LogFileMode |= et.EVENT_TRACE_SYSTEM_LOGGER_MODE
+    noyau.get().contents.EnableFlags = FLAG_NETWORK_TCPIP
+    sources = [
+        ("Kernel-Network, tout", "NetGate-Test-KN",
+         [_etw.ProviderInfo("Microsoft-Windows-Kernel-Network", _GUID(KERNEL_NETWORK_GUID),
+                            level=5, any_keywords=0xFFFFFFFFFFFFFFFF)], None),
+        ("noyau TcpIp/UdpIp", "NetGate-Test-Noyau", [], noyau),
+        # Transfer, ProcessIdHint, SendPath, ReceivePath
+        ("TCPIP transferts", "NetGate-Test-Transferts",
+         [_etw.ProviderInfo("Microsoft-Windows-TCPIP", _GUID(TCPIP_GUID), level=5,
+                            any_keywords=0x300000300)], None),
+    ]
+    for titre, nom, providers, props in sources:
+        try:
+            tous, miens, champs, bilan = ecoute_diagnostic(nom, providers, props)
         except Exception as e:
-            note("", "essai %s : impossible (%s)" % (nom, e))
-            EtwMeter._arreter_session("NetGate-Test-Variante")
+            if nom != "NetGate-Test-Noyau":
+                note("", "source %s : impossible (%s)" % (titre, e))
+                continue
+            # repli : la session noyau historique, sans jamais arreter celle
+            # d'un autre programme
+            try:
+                tous, miens, champs, bilan = ecoute_diagnostic(
+                    "NT Kernel Logger",
+                    [_etw.ProviderInfo("Noyau", _GUID(SYSTEM_TRACE_GUID),
+                                       any_keywords=FLAG_NETWORK_TCPIP)], arreter=False)
+                titre += " (NT Kernel Logger, apres : %s)" % e
+            except Exception as e2:
+                note("", "source %s : impossible (%s ; NT Kernel Logger : %s)"
+                     % (titre, e, e2))
+                continue
+        haut = sorted(miens.items(), key=lambda kv: -kv[1])[:4]
+        note("", "source %s : %d evenements (tous programmes), %d de ce programme%s%s"
+             % (titre, sum(tous.values()), sum(miens.values()),
+                (" : " + ", ".join("%s id %s op %s x%d" % (k[0], k[1], k[2], n)
+                                   for k, n in haut)) if haut else "",
+                " [tampons ecrits %d, evenements perdus %d, tampons perdus %d]" % bilan
+                if bilan else ""))
+        if not haut and tous:
+            note("", "   recus : %s" % ", ".join(
+                "%s id %s op %s x%d" % (k[0], k[1], k[2], n)
+                for k, n in sorted(tous.items(), key=lambda kv: -kv[1])[:5]))
+        cle = haut[0][0] if haut else (max(tous, key=tous.get) if tous else None)
+        if cle:
+            note("", "   champs (%s id %s) : %s" % (cle[0], cle[1], ", ".join(champs[cle])[:150]))
+    note_ecoutes(note, "apres le diagnostic")
 
 
 # ==========================================================================
