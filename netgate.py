@@ -4823,15 +4823,25 @@ class NetGateApp(tk.Tk):
         if pystray is None or Image is None:
             missing.append("pystray pillow")
         if missing:
+            if getattr(sys, "frozen", False):
+                remede = ("Cet executable a ete construit sans eux : relance "
+                          "construire_exe.bat depuis un Python qui les possede.")
+            else:
+                # plusieurs Python sur un meme PC : "pip install" tout court
+                # peut viser un autre Python que celui qui lance NetGate
+                commande = '"%s" -m pip install %s' % (sys.executable, " ".join(missing))
+                remede = ("Ouvre PowerShell et tape (Ctrl+C copie ce message) :\n\n"
+                          "%s\n\nCe chemin est celui du Python qui fait tourner "
+                          "NetGate." % commande)
+                log_line("modules absents ; a installer avec : %s" % commande)
             messagebox.showwarning(
                 "Modules a installer",
-                "Il manque : %s\n\nOuvre l'invite de commandes et tape :\n"
-                "    pip install %s\n\n"
+                "Il manque : %s\n\n%s\n\n"
                 "Sans psutil : aucune detection des programmes.\n"
-                "Sans pywintrace : pas de detail par programme (l'enveloppe reste "
-                "mesuree sur la carte reseau).\n"
+                "Sans pywintrace : pas de detail par programme ni d'alerte de "
+                "connexion bloquee (l'enveloppe reste mesuree sur la carte reseau).\n"
                 "Sans pystray/pillow : pas d'icone dans la zone de notification."
-                % (", ".join(missing), " ".join(missing)))
+                % (", ".join(missing), remede))
         if getattr(self, "_roll_au_demarrage", False):
             hier = sorted(self.state_mgr.data["history"].keys())[-1:] or [""]
             veille = self.state_mgr.data["history"].get(hier[0], {})
@@ -4924,6 +4934,16 @@ def selftest_wfp():
     note("INFO", "%s %s - autotest du moteur de filtrage (WFP)" % (APP_NAME, VERSION_TXT))
     note("INFO", "Windows %d.%d.%d, Python %s, administrateur : %s"
          % (sys.getwindowsversion()[:3] + (sys.version.split()[0], is_admin())))
+    note("INFO", "programme : %s" % sys.executable)
+    manquants = [nom for nom, module in (("psutil", psutil), ("pywintrace", _etw),
+                                         ("pystray", pystray), ("pillow", Image))
+                 if module is None]
+    if manquants:
+        # le moteur n'en a pas besoin, mais NetGate si : a signaler clairement
+        note("ATTENTION", "modules absents de ce Python : %s" % ", ".join(manquants))
+        if not getattr(sys, "frozen", False):
+            note("", 'a installer : "%s" -m pip install %s'
+                 % (sys.executable, " ".join(manquants)))
     if not exige(is_admin(), "droits administrateur"):
         return fin()
 
@@ -4961,6 +4981,9 @@ def selftest_wfp():
         except Exception as e:
             note("ATTENTION", "session ETW de test impossible : %s" % e)
             session = None
+    else:
+        note("ATTENTION", "detection des connexions bloquees non testee : "
+                          "pywintrace absent de ce Python")
 
     try:
         eng.add_filter("C4", 1, FWP_ACTION_BLOCK, [cond_moi, vers(TEST_ADRESSE[0])],
