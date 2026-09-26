@@ -20,7 +20,7 @@ enveloppe journalière avec alertes à 50, 80 et 100 % et coupure à 100 %.
 Il produit une liste d'autorisations qui vous survit d'un lancement à
 l'autre, un compteur par programme et par jour, et un blason dans la zone
 de notification qui se remplit avec votre consommation. Version actuelle :
-2.0.
+2.1.
 
 Python 3.8+ avec tkinter, `psutil`, `pywintrace`, `pystray` et `pillow` —
 Windows 10 ou 11, droits administrateur.
@@ -440,6 +440,13 @@ pour voir l'erreur, ou ouvrez `netgate.log` à côté de `netgate.py` (ou dans
 pas installé, ou la session ETW n'a pas pu démarrer (droits administrateur
 refusés). L'enveloppe reste mesurée sur la carte réseau ; seul le détail
 par programme manque.
+
+**Le bandeau indique « détail par programme : aucun événement reçu »** — la
+carte réseau voit passer du trafic, mais l'écoute par programme ne reçoit
+rien : la colonne *Consommé* resterait à zéro. L'enveloppe, elle, reste
+juste. Quittez NetGate et lancez l'autotest : sa dernière ligne contrôle le
+comptage par programme et, s'il échoue, essaie plusieurs réglages pour dire
+lequel fonctionne sur ce PC.
 
 **Le bandeau indique « filtrage : pare-feu Windows (repli) »** — le moteur
 NetGate n'a pas pu s'ouvrir ou a échoué ; la raison est dans les réglages
