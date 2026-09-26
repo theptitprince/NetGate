@@ -294,6 +294,8 @@ replie automatiquement sur `%APPDATA%\NetGate`.
 | `netgate.state.json` | réglages, profils, autorisations, compteurs du jour, historique, catalogue des programmes vus. **Copiez-le pour sauvegarder votre configuration.** Renommez-le pour repartir de zéro. |
 | `netgate.log` | trace de démarrage et erreurs éventuelles : le premier fichier à ouvrir quand quelque chose ne va pas. |
 | `netgate.ico` | le blason, régénéré à chaque changement de profil ou de palier de consommation, pour la fenêtre et l'exécutable. |
+| `netgate-test-wfp.txt` | le rapport du dernier autotest du moteur (`--test-wfp`). |
+| `netgate.state.json.v2.bak` | copie de l'état tel qu'il était avant sa conversion par la version 1.4 ; supprimable une fois la 1.4 validée. |
 
 `netgate.state.json` contient les chemins de vos programmes : c'est un
 fichier personnel, ne le partagez pas tel quel.
