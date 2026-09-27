@@ -62,11 +62,16 @@ V2.0  Moteur de filtrage NetGate : les filtres vivent dans la Windows
       (evenement TCPIP 1020) : carte de demande meme pour un programme qui
       n'a jamais reussi a sortir. Repli automatique sur le pare-feu Windows.
       Autotest sans risque : python netgate.py --test-wfp.
-V2.1  Comptage par programme retabli : abonnement a Kernel-Network avec tous
-      les mots-cles, detection des refus dans une session a part, sessions
-      ETW recreees au lieu d'etre reprises en silence, et fermees en
-      quittant. Le bandeau signale une ecoute qui ne recoit rien ; l'autotest
-      controle le comptage de bout en bout.
+V2.1  Comptage par programme retabli : sur Windows 11, les evenements de
+      Kernel-Network n'arrivent jamais dans une session ordinaire ; NetGate
+      ecoute le tracage reseau du noyau dans sa propre session systeme,
+      Kernel-Network en repli. Detection des refus dans une session a part,
+      sessions ETW recreees au lieu d'etre reprises en silence, et fermees
+      en quittant. Le bandeau signale une ecoute qui ne recoit rien ;
+      l'autotest controle le comptage de bout en bout.
+V2.2  Un seul NetGate a la fois sur la machine : un second lancement affiche
+      la fenetre de celui qui tourne deja (meme reduit pres de l'horloge),
+      sans redemander les droits administrateur.
 """
 
 import contextlib
@@ -134,7 +139,7 @@ ANNEE = "2026"
 # Numerotation : V<majeure>.<mineure>, plus une lettre pour une retouche
 # mineure (V1.1a). La majeure change en cas de refonte, la mineure a chaque
 # ajout ou correction, la lettre pour un ajustement cosmetique.
-VERSION = "2.1"
+VERSION = "2.2"
 
 VERSION_TXT = "V" + VERSION
 COPYRIGHT = "%s \u00a9 %s" % (AUTEUR, ANNEE)
@@ -344,6 +349,155 @@ def relaunch_as_admin():
     params = " ".join('"%s"' % a for a in args)
     ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params,
                                         os.getcwd(), 1)
+
+
+# --------------------------------------------------------------------------
+#  Une seule instance, sur toute la machine : deux NetGate se disputeraient
+#  le moteur de filtrage, les sessions d'ecoute et le fichier d'etat. Le
+#  verrou est un mutex nomme ; un evenement nomme permet a un second
+#  lancement de demander a la fenetre deja ouverte de s'afficher.
+# --------------------------------------------------------------------------
+_ERROR_ACCESS_DENIED = 5
+_ERROR_ALREADY_EXISTS = 183
+_SYNCHRONIZE = 0x00100000
+_MUTEX_MODIFY_STATE = 0x0001
+_EVENT_MODIFY_STATE = 0x0002
+_ASFW_ANY = 0xFFFFFFFF
+_k32_instance = None
+
+
+class _SecurityAttributes(ctypes.Structure):
+    _fields_ = [("nLength", ctypes.c_ulong),
+                ("lpSecurityDescriptor", ctypes.c_void_p),
+                ("bInheritHandle", ctypes.c_int)]
+
+
+def _k32():
+    global _k32_instance
+    if _k32_instance is None:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        for nom, args in (("CreateMutexW", [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]),
+                          ("OpenMutexW", [ctypes.c_ulong, ctypes.c_int, ctypes.c_wchar_p]),
+                          ("CreateEventW", [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                            ctypes.c_wchar_p]),
+                          ("OpenEventW", [ctypes.c_ulong, ctypes.c_int, ctypes.c_wchar_p])):
+            f = getattr(k, nom)
+            f.argtypes, f.restype = args, ctypes.c_void_p
+        k.SetEvent.argtypes = [ctypes.c_void_p]
+        k.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        k.WaitForSingleObject.restype = ctypes.c_ulong
+        k.CloseHandle.argtypes = [ctypes.c_void_p]
+        k.LocalFree.argtypes = [ctypes.c_void_p]
+        _k32_instance = k
+    return _k32_instance
+
+
+def _nom_instance(quoi):
+    return "Global\\NetGate-{%s}-%s" % (WFP_SUBLAYER, quoi)
+
+
+def _creer_objet(fabrique, droits_de_tous, *args):
+    """Cree un objet nomme que tout utilisateur connecte peut attendre et
+    signaler (droits_de_tous) : sans cela, un NetGate lance sans elevation
+    ne verrait pas celui qui tourne en administrateur. Renvoie (poignee,
+    code d'erreur de Windows)."""
+    k = _k32()
+    sd = ctypes.c_void_p()
+    conv = ctypes.WinDLL("advapi32").ConvertStringSecurityDescriptorToSecurityDescriptorW
+    conv.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p),
+                     ctypes.c_void_p]
+    sa = None
+    if conv("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x%x;;;AU)" % droits_de_tous, 1,
+            ctypes.byref(sd), None):
+        sa = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), sd, 0)
+    try:
+        h = fabrique(ctypes.byref(sa) if sa else None, *args)
+        return h, ctypes.get_last_error()
+    finally:
+        if sd:
+            k.LocalFree(sd)
+
+
+def instance_lancee():
+    """Un NetGate tourne-t-il deja sur cette machine ? Sans rien prendre : le
+    lancement qui va se relancer en administrateur ne doit pas garder le
+    verrou, sa copie elevee se croirait en double."""
+    k = _k32()
+    h = k.OpenMutexW(_SYNCHRONIZE, False, _nom_instance("instance"))
+    if h:
+        k.CloseHandle(h)
+        return True
+    return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+
+
+def reserver_instance():
+    """Prend le verrou pour toute la vie du programme et ouvre la ligne
+    d'appel. Renvoie (verrou, appel), ou None si un autre NetGate l'a deja.
+    Si Windows refuse tout pour une autre raison, NetGate demarre quand
+    meme : mieux vaut deux instances qu'aucune."""
+    k = _k32()
+    verrou, err = _creer_objet(k.CreateMutexW, _SYNCHRONIZE | _MUTEX_MODIFY_STATE,
+                               False, _nom_instance("instance"))
+    if not verrou:
+        if err == _ERROR_ACCESS_DENIED:
+            return None
+        log_line("verrou d'instance indisponible (erreur %d)" % err)
+        return None, None
+    if err == _ERROR_ALREADY_EXISTS:
+        k.CloseHandle(verrou)
+        return None
+    appel, _ = _creer_objet(k.CreateEventW, _SYNCHRONIZE | _EVENT_MODIFY_STATE,
+                            False, False, _nom_instance("afficher"))
+    return verrou, appel
+
+
+def appeler_instance():
+    """Demande au NetGate deja lance d'afficher sa fenetre. False si l'appel
+    n'a pas pu etre passe (un NetGate plus ancien, sans ligne d'appel)."""
+    k = _k32()
+    h = k.OpenEventW(_EVENT_MODIFY_STATE, False, _nom_instance("afficher"))
+    if not h:
+        return False
+    try:
+        # c'est ce lancement-ci que l'utilisateur vient de faire : il cede sa
+        # place au premier plan a la fenetre de l'autre NetGate
+        u32 = ctypes.WinDLL("user32")
+        u32.AllowSetForegroundWindow.argtypes = [ctypes.c_ulong]
+        u32.AllowSetForegroundWindow(_ASFW_ANY)
+        return bool(k.SetEvent(h))
+    finally:
+        k.CloseHandle(h)
+
+
+def ecouter_appels(appel, app):
+    """Fil d'attente du premier NetGate : chaque second lancement affiche sa
+    fenetre, comme un clic sur l'icone."""
+    k = _k32()
+    while k.WaitForSingleObject(appel, 0xFFFFFFFF) == 0:
+        for _ in range(10):
+            try:
+                app.after(0, app.show_window)
+                break
+            except RuntimeError:        # boucle de la fenetre pas encore lancee
+                time.sleep(0.5)
+            except Exception:           # fenetre detruite : NetGate se ferme
+                return
+
+
+def deja_lance():
+    """Second lancement : montre la fenetre du NetGate qui tourne, ou dit ou
+    le trouver si l'appel n'a pas pu passer."""
+    log_line("lancement ignore : NetGate tourne deja")
+    if appeler_instance():
+        return
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(APP_NAME, "NetGate est deja lance : son icone est pres de "
+                                      "l'horloge. Un clic dessus affiche sa fenetre.")
+        root.destroy()
+    except Exception:
+        pass
 
 
 def fmt_bytes(n):
@@ -2970,6 +3124,8 @@ HELP = [
           "reste actif. Pour tout arreter, utilise Quitter dans le menu de l'icone : "
           "les regles sont alors supprimees automatiquement. Clic droit sur l'icone "
           "pour rouvrir, voir les Mo restants, tout debloquer ou quitter. "
+          "Relancer NetGate alors qu'il tourne deja n'en ouvre pas un second : sa "
+          "fenetre reapparait. "
           "Le blason se remplit avec ta consommation : vert, puis orange, puis rouge."),
 
     ("h1", "Les profils, facultatifs"),
@@ -5587,6 +5743,12 @@ def main():
             return 0
         return 0 if selftest_wfp() else 1
 
+    # un seul NetGate a la fois : un second lancement montre la fenetre du
+    # premier, sans demander l'elevation pour rien
+    if instance_lancee():
+        deja_lance()
+        return 0
+
     log_line("--- demarrage %s | python %s | admin=%s | psutil=%s | pywintrace=%s | "
              "pystray=%s | pillow=%s"
              % (VERSION_TXT, sys.version.split()[0], is_admin(), psutil is not None,
@@ -5611,6 +5773,13 @@ def main():
             return 0
         log_line("mode limite : sans droits administrateur")
 
+    # le verrou, garde jusqu'a la fin : pris ici, dans le processus qui fait
+    # vraiment tourner NetGate
+    reserve = reserver_instance()
+    if reserve is None:                 # lance entre-temps (double-clic)
+        deja_lance()
+        return 0
+
     app = None
     try:
         app = NetGateApp()
@@ -5618,6 +5787,9 @@ def main():
         log_error("plantage pendant la construction de la fenetre")
         _fatal(e)
         return 1
+    if reserve[1]:
+        threading.Thread(target=ecouter_appels, args=(reserve[1], app),
+                         name="Appels", daemon=True).start()
     try:
         app.mainloop()
     except Exception as e:
