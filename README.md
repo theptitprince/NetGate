@@ -97,7 +97,7 @@ sections :
 | `WfpEngine` | la session dynamique dans le moteur de filtrage de Windows (WFP) : sous-couche, filtres, transactions |
 | `wfp_specs`, `WfpBackend` | traduisent la liste d'autorisations en filtres NetGate et n'appliquent que les différences |
 | `Firewall`, `NetshBackend` | le moteur de repli : des règles du pare-feu Windows posées par `netsh advfirewall` |
-| `EtwMeter` | écoute le fournisseur Kernel-Network et attribue à chaque processus ses octets échangés avec Internet ; repère les connexions refusées |
+| `EtwMeter` | écoute le traçage réseau du noyau (Kernel-Network en repli) et attribue à chaque processus ses octets échangés avec Internet ; repère les connexions refusées |
 | `NicMeter` | lit les compteurs des cartes réseau : la mesure de l'enveloppe |
 | `ConnScanner` | découvre les connexions ouvertes et signale les programmes sans décision |
 | `State` | charge et sauvegarde le fichier d'état, gère les périodes et les profils |
@@ -144,12 +144,14 @@ NetGate fermé, lancez l'autotest :
 python netgate.py --test-wfp
 ```
 
-Il demande les droits administrateur, vérifie en une quinzaine de secondes
-que le moteur de filtrage fonctionne sur ce PC, et laisse un rapport
+Il demande les droits administrateur, vérifie en une vingtaine de secondes
+que le moteur de filtrage fonctionne sur ce PC et que le comptage par
+programme attribue bien le trafic, et laisse un rapport
 `netgate-test-wfp.txt`. Il ne touche à rien d'autre qu'à lui-même : ses
 filtres de test ne visent que sa propre connexion vers une adresse de
 documentation (`192.0.2.1`, inexistante sur Internet) ou vers localhost, et
-disparaissent à la fin. Avec l'exécutable : `NetGate.exe --test-wfp`.
+disparaissent à la fin ; le contrôle du comptage envoie quelques Ko vers
+cette même adresse. Avec l'exécutable : `NetGate.exe --test-wfp`.
 
 ---
 
@@ -243,13 +245,16 @@ VPN, VirtualBox, Hyper-V) ne sont pas comptées : elles relaient un trafic
 qui sort ensuite par la carte physique, les compter le décompterait deux
 fois. Réglages → *Cartes décomptées* pour changer ce choix.
 
-**Le détail par programme.** NetGate s'abonne au fournisseur
-`Microsoft-Windows-Kernel-Network` (Event Tracing for Windows) pour
-attribuer à chaque processus les octets qu'il échange avec Internet ;
-chaque événement porte les deux adresses de la connexion, ce qui permet
-d'écarter localhost et le réseau local. Si `pywintrace` manque ou si la
-session ETW ne peut pas démarrer, l'enveloppe reste mesurée sur la carte,
-sans détail par programme. Avec un VPN, le programme et le VPN comptent
+**Le détail par programme.** NetGate ouvre sa propre session « système »
+d'Event Tracing for Windows et y reçoit le traçage réseau du noyau (les
+événements TCP et UDP d'envoi et de réception) pour attribuer à chaque
+processus les octets qu'il échange avec Internet ; chaque événement porte
+les deux adresses de la connexion, ce qui permet d'écarter localhost et le
+réseau local. Le fournisseur `Microsoft-Windows-Kernel-Network` porte les
+mêmes informations, mais sur Windows 11 (build 26200) ses événements
+n'arrivent jamais dans une session ordinaire : il ne sert plus que de
+repli. Si `pywintrace` manque ou si aucune session ne peut démarrer,
+l'enveloppe reste mesurée sur la carte, sans détail par programme. Avec un VPN, le programme et le VPN comptent
 chacun leur part : la somme de la liste peut dépasser l'enveloppe, qui
 reste juste.
 
@@ -444,9 +449,9 @@ par programme manque.
 **Le bandeau indique « détail par programme : aucun événement reçu »** — la
 carte réseau voit passer du trafic, mais l'écoute par programme ne reçoit
 rien : la colonne *Consommé* resterait à zéro. L'enveloppe, elle, reste
-juste. Quittez NetGate et lancez l'autotest : sa dernière ligne contrôle le
-comptage par programme et, s'il échoue, essaie plusieurs réglages pour dire
-lequel fonctionne sur ce PC.
+juste. Quittez NetGate et lancez l'autotest : ses dernières lignes contrôlent
+le comptage par programme et, s'il échoue, interrogent plusieurs sources
+pour dire laquelle fonctionne sur ce PC.
 
 **Le bandeau indique « filtrage : pare-feu Windows (repli) »** — le moteur
 NetGate n'a pas pu s'ouvrir ou a échoué ; la raison est dans les réglages
