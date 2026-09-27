@@ -20,7 +20,7 @@ enveloppe journalière avec alertes à 50, 80 et 100 % et coupure à 100 %.
 Il produit une liste d'autorisations qui vous survit d'un lancement à
 l'autre, un compteur par programme et par jour, et un blason dans la zone
 de notification qui se remplit avec votre consommation. Version actuelle :
-2.1.
+2.2.
 
 **Télécharger.** `NetGate.exe`, autonome (inutile d'installer Python), est
 joint à la [dernière version publiée](https://github.com/theptitprince/NetGate/releases/latest).
@@ -139,6 +139,10 @@ l'icône (*Quitter*). À ce moment, tous les filtres de NetGate disparaissent
 et Internet redevient normal. Ce détour est volontaire : une fermeture par
 mégarde ne doit jamais couper la surveillance en laissant croire qu'elle
 tourne.
+
+**Un seul NetGate à la fois.** Le relancer alors qu'il tourne déjà, même
+réduit près de l'horloge, n'en ouvre pas un second : sa fenêtre réapparaît.
+Deux NetGate se disputeraient le moteur de filtrage et le compteur.
 
 **Vérifier le moteur, une fois.** Avant la première utilisation sur un PC,
 NetGate fermé, lancez l'autotest :
