@@ -22,8 +22,11 @@ l'autre, un compteur par programme et par jour, et un blason dans la zone
 de notification qui se remplit avec votre consommation. Version actuelle :
 2.1.
 
-Python 3.8+ avec tkinter, `psutil`, `pywintrace`, `pystray` et `pillow` —
-Windows 10 ou 11, droits administrateur.
+**Télécharger.** `NetGate.exe`, autonome (inutile d'installer Python), est
+joint à la [dernière version publiée](https://github.com/theptitprince/NetGate/releases/latest).
+Pour faire tourner le script lui-même : Python 3.8+ avec tkinter, `psutil`,
+`pywintrace`, `pystray` et `pillow` — Windows 10 ou 11, droits
+administrateur.
 
 ---
 
