@@ -1,12 +1,30 @@
+<div align="center">
+
 # NetGate — Contrôle d'accès Internet par application
 
-[![Licence GPL-3.0-or-later](https://img.shields.io/badge/licence-GPL--3.0--or--later-blue.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB.svg)](https://www.python.org/downloads/)
-[![Windows](https://img.shields.io/badge/plateforme-Windows%2010%2F11-0078D6.svg)](#1-installation)
+**Le robinet Internet est fermé ; vous l'ouvrez programme par programme.**
 
-Le robinet Internet est fermé ; vous l'ouvrez programme par programme.
-NetGate compte ce que chacun consomme, vous prévient quand l'enveloppe du
-jour s'épuise, et coupe Internet quand elle est vide.
+![Version](https://img.shields.io/badge/version-2.2-2ea44f)
+![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)
+![tkinter](https://img.shields.io/badge/interface-tkinter-3776AB?logo=python&logoColor=white)
+![WFP](https://img.shields.io/badge/filtrage-Windows%20Filtering%20Platform-0078D6?logo=windows&logoColor=white)
+![ETW](https://img.shields.io/badge/comptage-ETW%20%28pywintrace%29-0078D6?logo=windows&logoColor=white)
+![Plateforme](https://img.shields.io/badge/plateforme-Windows%2010%2F11-0078D6?logo=windows&logoColor=white)
+![Licence](https://img.shields.io/badge/licence-GPL--3.0--or--later-blue)
+
+</div>
+
+---
+
+> [!NOTE]
+> **Windows 10 ou 11, droits administrateur.** NetGate filtre les connexions et demande donc les droits
+> administrateur au lancement ; sans eux, il propose un mode limité, où rien n'est bloqué. La protection est
+> **inactive** tant que vous ne l'activez pas : observez d'abord, bloquez ensuite. **Fermer la fenêtre ne quitte pas** : NetGate
+> continue de surveiller depuis la zone de notification, et seul *Quitter*, dans le menu de son icône, l'arrête.
+> En cas de doute, le bouton **PANIQUE** rétablit Internet immédiatement.
+
+NetGate compte ce que chaque programme consomme, vous prévient quand
+l'enveloppe du jour s'épuise, et coupe Internet quand elle est vide.
 
 **À qui ça sert.** À quiconque vit sur une connexion comptée — partage de
 connexion mobile, clé 4G, forfait data limité, liaison satellite — où chaque
@@ -19,8 +37,11 @@ attribue à chaque programme ce qu'il échange avec Internet, et tient une
 enveloppe journalière avec alertes à 50, 80 et 100 % et coupure à 100 %.
 Il produit une liste d'autorisations qui vous survit d'un lancement à
 l'autre, un compteur par programme et par jour, et un blason dans la zone
-de notification qui se remplit avec votre consommation. Version actuelle :
-2.2.
+de notification qui se remplit avec votre consommation.
+
+Version actuelle : 2.2 — l'historique des livraisons est sur la page des
+[versions publiées](https://github.com/theptitprince/NetGate/releases), et
+résumé en tête de `netgate.py`.
 
 **Télécharger.** `NetGate.exe`, autonome (inutile d'installer Python), est
 joint à la [dernière version publiée](https://github.com/theptitprince/NetGate/releases/latest).
@@ -28,9 +49,26 @@ Pour faire tourner le script lui-même : Python 3.8+ avec tkinter, `psutil`,
 `pywintrace`, `pystray` et `pillow` — Windows 10 ou 11, droits
 administrateur.
 
+## Sommaire
+
+- [1. Installation](#1-installation)
+- [2. Les fichiers](#2-les-fichiers)
+- [3. Lancement](#3-lancement)
+- [4. Prise en main](#4-prise-en-main)
+- [5. Comment ça marche](#5-comment-ça-marche)
+- [6. Ce que le programme crée à côté de lui](#6-ce-que-le-programme-crée-à-côté-de-lui)
+- [7. L'enveloppe, les plages horaires, les profils](#7-lenveloppe-les-plages-horaires-les-profils)
+- [8. Construire un exécutable](#8-construire-un-exécutable)
+- [9. En cas de souci](#9-en-cas-de-souci)
+- [10. Licence](#10-licence)
+
 ---
 
 ## 1. Installation
+
+Avec `NetGate.exe`, rien à installer : rangez-le dans son propre dossier et
+passez directement au [lancement](#3-lancement). Ce qui suit concerne le
+script `netgate.py`.
 
 ### Python
 
@@ -69,14 +107,16 @@ vous puissiez décider en connaissance de cause.
 |---|---|---|
 | `psutil` | découverte des connexions ouvertes, adresses des cartes réseau | aucun programme n'est détecté, aucune notification n'apparaît |
 | `pywintrace` | comptage par programme (Event Tracing for Windows) | l'enveloppe reste mesurée sur la carte réseau, sans détail par programme |
-| `pystray` + `pillow` | l'icône dans la zone de notification et son menu | la fenêtre principale reste seule, sans blason près de l'horloge |
+| `pystray` + `pillow` | l'icône dans la zone de notification et son menu | la fenêtre principale reste seule, sans blason près de l'horloge ; sa croix la réduit alors dans la barre des tâches |
 
 ### Les droits administrateur
 
-Filtrer les connexions exige l'élévation : NetGate la demande lui-même au
-lancement (invite UAC). Si vous la refusez, il propose un **mode
-limité** où l'interface et les compteurs fonctionnent, mais où rien n'est
-bloqué. C'est un bon mode pour observer avant de décider.
+Filtrer les connexions exige l'élévation. Lancé sans ces droits, NetGate
+propose lui-même de se relancer en administrateur (*Oui*, puis l'invite UAC
+de Windows) ou de s'ouvrir en **mode limité** (*Non*), où l'interface et les
+compteurs fonctionnent, mais où rien n'est bloqué. C'est un bon mode pour
+observer avant de décider. `NetGate.exe`, lui, demande l'élévation à Windows
+dès son lancement.
 
 ---
 
@@ -92,8 +132,20 @@ Récupérez le dépôt, au choix :
 git clone https://github.com/theptitprince/NetGate.git C:\NetGate
 ```
 
-Le programme tient en **un seul fichier**, `netgate.py`, organisé en
-sections :
+| Fichier | Rôle |
+|---|---|
+| `netgate.py` | le programme complet, en un seul fichier |
+| `LICENSE` | le texte de la licence du programme (voir [Licence](#10-licence)) |
+| `README.md` | ce document |
+| `NetGate.exe` | l'exécutable autonome, joint aux [versions publiées](https://github.com/theptitprince/NetGate/releases) (il n'est pas dans le dépôt) |
+
+Placez `netgate.py` (ou `NetGate.exe`) **dans son propre dossier** : il y
+crée ses fichiers de travail (voir
+[Ce que le programme crée à côté de lui](#6-ce-que-le-programme-crée-à-côté-de-lui)).
+
+### Organisation de `netgate.py`
+
+Le programme tient en **un seul fichier**, organisé en sections :
 
 | Section | Rôle |
 |---|---|
@@ -109,12 +161,6 @@ sections :
 | `Tray` | l'icône de la zone de notification et son menu |
 | `NetGateApp` | la fenêtre principale, les réglages, la liste, les plages horaires |
 
-Le fichier `LICENSE` contient le texte de la licence du programme (voir
-« Licence » en fin de document).
-
-Placez `netgate.py` **dans son propre dossier** : il y crée ses fichiers de
-travail (voir « Ce que le programme crée à côté de lui »).
-
 ---
 
 ## 3. Lancement
@@ -125,9 +171,10 @@ Ouvrez PowerShell dans le dossier du programme et tapez :
 python netgate.py
 ```
 
-Windows demande les droits administrateur : acceptez. La fenêtre principale
-s'ouvre, et un blason apparaît dans la zone de notification, à côté de
-l'horloge.
+Si PowerShell n'est pas lui-même administrateur, NetGate propose de se
+relancer avec ces droits : répondez *Oui*, puis acceptez l'invite de Windows.
+La fenêtre principale s'ouvre, et un blason apparaît dans la zone de notification, à côté de
+l'horloge. Avec l'exécutable, un double-clic sur `NetGate.exe` suffit.
 
 Un raccourci sur le bureau est pratique : cible
 `python C:\NetGate\netgate.py`, dossier de démarrage `C:\NetGate`. Pour
@@ -141,8 +188,10 @@ mégarde ne doit jamais couper la surveillance en laissant croire qu'elle
 tourne.
 
 **Un seul NetGate à la fois.** Le relancer alors qu'il tourne déjà, même
-réduit près de l'horloge, n'en ouvre pas un second : sa fenêtre réapparaît.
-Deux NetGate se disputeraient le moteur de filtrage et le compteur.
+réduit près de l'horloge, n'en ouvre pas un second : sa fenêtre réapparaît
+(relancé par `python netgate.py`, il ne redemande même pas les droits
+administrateur). Deux NetGate se disputeraient le moteur de filtrage et le
+compteur.
 
 **Vérifier le moteur, une fois.** Avant la première utilisation sur un PC,
 NetGate fermé, lancez l'autotest :
@@ -158,7 +207,11 @@ programme attribue bien le trafic, et laisse un rapport
 filtres de test ne visent que sa propre connexion vers une adresse de
 documentation (`192.0.2.1`, inexistante sur Internet) ou vers localhost, et
 disparaissent à la fin ; le contrôle du comptage envoie quelques Ko vers
-cette même adresse. Avec l'exécutable : `NetGate.exe --test-wfp`.
+cette même adresse. Avec l'exécutable :
+
+```powershell
+.\NetGate.exe --test-wfp
+```
 
 ---
 
@@ -173,7 +226,8 @@ une session de travail.
 Ensuite :
 
 1. **Réglages** : enveloppe du jour (en Mo), heure de remise à zéro, et la
-   case *DNS/DHCP essentiels*, à laisser cochée.
+   case *Autoriser DNS/DHCP (indispensable en mode protégé)*, à laisser
+   cochée.
 2. **Activer la protection.**
 3. Ouvrez votre navigateur : une carte apparaît en bas à droite, cliquez
    *Autoriser*.
@@ -198,108 +252,129 @@ Platform** (WFP). NetGate 2 y pose les siens directement, comme le font les
 pare-feu applicatifs à la ZoneAlarm, sans pilote à installer et sans toucher
 aux règles du pare-feu Windows.
 
-**Le blocage.** Quand la protection est active, NetGate ouvre une session
-dans le moteur et y crée sa propre sous-couche, de priorité maximale. Dans
-cette sous-couche, le filtre de plus fort poids qui correspond décide :
-localhost ouvert, puis réseau local ouvert, puis la coupure (enveloppe
-épuisée, hors plage horaire), puis un filtre *autoriser* par programme
-accepté, et enfin *tout le reste est bloqué*. Les programmes refusés ou
-encore en attente n'ont pas de filtre à eux : le blocage général s'applique.
-Chaque changement est appliqué d'un bloc, dans une transaction, et ne touche
-que les filtres qui changent.
+### Le blocage
 
-**Pourquoi un moteur à soi.** Windows et de nombreux logiciels posent leurs
-propres règles *autoriser* dans le pare-feu Windows : applications du
-Store, services Windows, certains installateurs (plus d'une centaine sur un
-poste courant). Dans le pare-feu Windows, elles laissent passer leur
-programme malgré une politique *bloquer*. Dans le moteur, un blocage de la
-sous-couche NetGate est définitif : aucune de ces autorisations ne passe
-devant. *Bloquer* veut vraiment dire bloqué, et un programme en attente de
-réponse est bloqué lui aussi.
+Quand la protection est active, NetGate ouvre une session dans le moteur et
+y crée sa propre sous-couche, de priorité maximale. Dans cette sous-couche,
+le filtre de plus fort poids qui correspond décide : localhost ouvert, puis
+réseau local ouvert, puis la coupure (enveloppe épuisée, hors plage
+horaire), puis un filtre *autoriser* par programme accepté, et enfin *tout
+le reste est bloqué*. Les programmes refusés ou encore en attente n'ont pas
+de filtre à eux : le blocage général s'applique. Chaque changement est
+appliqué d'un bloc, dans une transaction, et ne touche que les filtres qui
+changent.
 
-**La session dynamique.** Les filtres de NetGate appartiennent à une session
-que Windows supprime dès que NetGate s'arrête, qu'il quitte normalement,
-plante ou soit tué. Rien ne peut rester bloqué à votre insu, et aucun
-nettoyage n'est nécessaire au démarrage suivant.
+### Pourquoi un moteur à soi
 
-**La règle DNS/DHCP « essentiels ».** Un filtre facultatif, coché par
-défaut, laisse passer `svchost.exe` vers les ports 53 (DNS), 67 et 547
+Windows et de nombreux logiciels posent leurs propres règles *autoriser*
+dans le pare-feu Windows : applications du Store, services Windows,
+certains installateurs (plus d'une centaine sur un poste courant). Dans le
+pare-feu Windows, elles laissent passer leur programme malgré une politique
+*bloquer*. Dans le moteur, un blocage de la sous-couche NetGate est
+définitif : aucune de ces autorisations ne passe devant. *Bloquer* veut
+vraiment dire bloqué, et un programme en attente de réponse est bloqué lui
+aussi.
+
+### La session dynamique
+
+Les filtres de NetGate appartiennent à une session que Windows supprime dès
+que NetGate s'arrête, qu'il quitte normalement, plante ou soit tué. Rien ne
+peut rester bloqué à votre insu, et aucun nettoyage n'est nécessaire au
+démarrage suivant.
+
+### La règle DNS/DHCP
+
+Un filtre facultatif, coché par défaut (case *Autoriser DNS/DHCP* des
+réglages), laisse passer `svchost.exe` vers les ports 53 (DNS), 67 et 547
 (DHCP). Sans lui, même les programmes autorisés ne résolvent plus aucun nom
 quand le serveur DNS est sur Internet (fréquent en 4G), et un modem en mode
 pont ne renouvelle plus l'adresse du PC. Si tout se met à échouer, c'est le
 premier réglage à vérifier.
 
-**Le moteur de repli.** Si le moteur NetGate ne peut pas s'ouvrir, ou s'il
-échoue en cours de route, NetGate bascule sur le moteur de la version 1 :
-des règles du pare-feu Windows posées par `netsh advfirewall`, toutes
-préfixées `NETGATE_`. La politique sortante passe à *bloquer*, une règle
-*autoriser* est créée par programme accepté et une règle *bloquer* par
-programme refusé ; une règle de blocage l'emporte sur toutes les
-autorisations de Windows. Ces règles survivent à NetGate : elles sont
-retirées en quittant, et au démarrage suivant après un arrêt brutal.
-Réglages → *Moteur de filtrage* pour choisir ce moteur ; le bandeau indique
-le moteur en service.
+### Le moteur de repli
 
-**Le comptage de l'enveloppe.** L'enveloppe est mesurée sur la carte
-réseau par laquelle passent les données (Wi-Fi, Ethernet, clé 4G, partage
-de connexion USB ou Bluetooth), avec les compteurs que montre le
-Gestionnaire des tâches : c'est la mesure la plus proche de celle de
-l'opérateur, en-têtes compris, trafic des machines virtuelles compris. Ce
-qui reste dans le PC n'y passe pas : un serveur WAMP, MySQL ou PHP
-interrogé en localhost ne coûte rien. Le trafic avec le réseau local (NAS,
-imprimante, autre PC) est retiré du compte. Les cartes virtuelles (tunnel
-VPN, VirtualBox, Hyper-V) ne sont pas comptées : elles relaient un trafic
-qui sort ensuite par la carte physique, les compter le décompterait deux
-fois. Réglages → *Cartes décomptées* pour changer ce choix.
+Si le moteur NetGate ne peut pas s'ouvrir, ou s'il échoue en cours de
+route, NetGate bascule sur le moteur de la version 1 : des règles du
+pare-feu Windows posées par `netsh advfirewall`, toutes préfixées
+`NETGATE_`. La politique sortante passe à *bloquer*, une règle *autoriser*
+est créée par programme accepté et une règle *bloquer* par programme
+refusé ; une règle de blocage l'emporte sur toutes les autorisations de
+Windows. Ces règles survivent à NetGate : elles sont retirées en quittant,
+et au démarrage suivant après un arrêt brutal. Réglages → *Moteur de
+filtrage* pour choisir ce moteur ; le bandeau indique le moteur en service.
 
-**Le détail par programme.** NetGate ouvre sa propre session « système »
-d'Event Tracing for Windows et y reçoit le traçage réseau du noyau (les
-événements TCP et UDP d'envoi et de réception) pour attribuer à chaque
-processus les octets qu'il échange avec Internet ; chaque événement porte
-les deux adresses de la connexion, ce qui permet d'écarter localhost et le
-réseau local. Le fournisseur `Microsoft-Windows-Kernel-Network` porte les
-mêmes informations, mais sur Windows 11 (build 26200) ses événements
-n'arrivent jamais dans une session ordinaire : il ne sert plus que de
-repli. Si `pywintrace` manque ou si aucune session ne peut démarrer,
-l'enveloppe reste mesurée sur la carte, sans détail par programme. Avec un VPN, le programme et le VPN comptent
+### Le comptage de l'enveloppe
+
+L'enveloppe est mesurée sur la carte réseau par laquelle passent les
+données (Wi-Fi, Ethernet, clé 4G, partage de connexion USB ou Bluetooth),
+avec les compteurs que montre le Gestionnaire des tâches : c'est la mesure
+la plus proche de celle de l'opérateur, en-têtes compris, trafic des
+machines virtuelles compris. Ce qui reste dans le PC n'y passe pas : un
+serveur WAMP, MySQL ou PHP interrogé en localhost ne coûte rien. Le trafic
+avec le réseau local (NAS, imprimante, autre PC) est retiré du compte. Les
+cartes virtuelles (tunnel VPN, VirtualBox, Hyper-V) ne sont pas comptées :
+elles relaient un trafic qui sort ensuite par la carte physique, les
+compter le décompterait deux fois. Réglages → *Cartes décomptées* pour
+changer ce choix.
+
+### Le détail par programme
+
+NetGate ouvre sa propre session « système » d'Event Tracing for Windows et
+y reçoit le traçage réseau du noyau (les événements TCP et UDP d'envoi et
+de réception) pour attribuer à chaque processus les octets qu'il échange
+avec Internet ; chaque événement porte les deux adresses de la connexion,
+ce qui permet d'écarter localhost et le réseau local. Le fournisseur
+`Microsoft-Windows-Kernel-Network` porte les mêmes informations, mais sur
+Windows 11 (build 26200) ses événements n'arrivent jamais dans une session
+ordinaire : il ne sert plus que de repli. Si `pywintrace` manque ou si
+aucune session ne peut démarrer, l'enveloppe reste mesurée sur la carte,
+sans détail par programme. Avec un VPN, le programme et le VPN comptent
 chacun leur part : la somme de la liste peut dépasser l'enveloppe, qui
 reste juste.
 
-**La découverte.** Toutes les 1,5 s, la liste des connexions ouvertes vers
-Internet est relevée et chaque exécutable qui n'a pas encore reçu de
-décision déclenche une carte de demande. Un programme bloqué, lui, n'a
-jamais de connexion ouverte : NetGate écoute donc aussi l'événement 1020 du
-fournisseur `Microsoft-Windows-TCPIP`, « connexion refusée par le moteur de
-filtrage », qui donne le processus et l'adresse visée. La carte apparaît
-alors avec la mention *Connexion bloquée* ; autorisez, et le programme
-réessaie de lui-même. Un programme qui ne parle qu'à localhost ou au
-réseau local ne déclenche rien.
+### La découverte
 
-**Les mises à jour.** Beaucoup de programmes changent de dossier à chaque
-version (`appli_2.110…`, `app-1.0.9187`, `152.0.4191.66`). NetGate les
-reconnaît : une seule ligne dans la liste, dont l'emplacement porte `*` à
-la place du numéro de version, et la décision suit la nouvelle version,
-règle du pare-feu comprise, sans reposer la question.
+Toutes les 1,5 s, la liste des connexions ouvertes vers Internet est
+relevée et chaque exécutable qui n'a pas encore reçu de décision déclenche
+une carte de demande. Un programme bloqué, lui, n'a jamais de connexion
+ouverte : NetGate écoute donc aussi l'événement 1020 du fournisseur
+`Microsoft-Windows-TCPIP`, « connexion refusée par le moteur de filtrage »,
+qui donne le processus et l'adresse visée. La carte apparaît alors avec la
+mention *Connexion bloquée* ; autorisez, et le programme réessaie de
+lui-même. Un programme qui ne parle qu'à localhost ou au réseau local ne
+déclenche rien.
 
-**L'inspecteur.** Pour répondre à « qui est ce programme ? », NetGate
-combine un glossaire en français des processus courants, la version et
-l'éditeur lus dans les ressources du fichier, la signature numérique, le
-titre de fenêtre, et pour `svchost.exe` le service Windows exact hébergé par
-ce processus.
+### Les mises à jour
 
-**La remise en état.** Le bouton **PANIQUE** ferme la session NetGate :
-tous les filtres disparaissent immédiatement et Internet revient. Si la
-session précédente utilisait le moteur de repli et s'est interrompue
-(coupure de courant, processus tué), NetGate retire au démarrage les règles
-`NETGATE_` restées dans le pare-feu Windows.
+Beaucoup de programmes changent de dossier à chaque version
+(`152.0.4191.66`, `app-1.0.9187`, `jre1.8.0_381`, ou le dossier versionné
+d'un paquet du Microsoft Store). NetGate les reconnaît : une seule ligne
+dans la liste, dont l'emplacement porte `*` à la place du numéro de
+version, et la décision suit la nouvelle version, règle du pare-feu
+comprise, sans reposer la question.
+
+### L'inspecteur
+
+Pour répondre à « qui est ce programme ? », NetGate combine un glossaire en
+français des processus courants, la version et l'éditeur lus dans les
+ressources du fichier, la signature numérique, le titre de fenêtre, et pour
+`svchost.exe` le service Windows exact hébergé par ce processus.
+
+### La remise en état
+
+Le bouton **PANIQUE** ferme la session NetGate : tous les filtres
+disparaissent immédiatement et Internet revient. Si la session précédente
+utilisait le moteur de repli et s'est interrompue (coupure de courant,
+processus tué), NetGate retire au démarrage les règles `NETGATE_` restées
+dans le pare-feu Windows.
 
 ---
 
 ## 6. Ce que le programme crée à côté de lui
 
-Tout est rangé **à côté de `netgate.py`**. Si ce dossier n'est pas
-inscriptible (Program Files, clé USB protégée, dossier réseau), NetGate se
-replie automatiquement sur `%APPDATA%\NetGate`.
+Tout est rangé **à côté de `netgate.py`** (ou de `NetGate.exe`). Si ce
+dossier n'est pas inscriptible (Program Files, clé USB protégée, dossier
+réseau), NetGate se replie automatiquement sur `%APPDATA%\NetGate`.
 
 | Fichier | Contenu |
 |---|---|
@@ -355,24 +430,27 @@ réunion.
 Réglages → *Plages horaires* : un tableau de 48 demi-heures à cocher. Hors
 plage, plus rien ne sort vers Internet, même les programmes autorisés, quel
 que soit le profil ; localhost et le réseau local restent ouverts.
-Raccourcis *tout ouvrir*, *tout fermer*, *08h-22h*. Le bandeau indique la
+Raccourcis *Tout ouvrir*, *Tout fermer*, *08h - 22h*. Le bandeau indique la
 prochaine ouverture ou fermeture, pour que vous ne cherchiez pas pourquoi
 tout s'est arrêté à 22 h.
 
 ### L'icône près de l'horloge
 
 Le blason se remplit avec la consommation (vert → orange → rouge). Clic
-droit : *Ouvrir*, choix du profil, Mo restants, *Rallonge* pendant une
-coupure, *Tout débloquer (PANIQUE)*, *Quitter*.
+droit : *Ouvrir NetGate*, choix du profil (si vous en avez créé), la
+consommation du jour rapportée à l'enveloppe avec le profil actif,
+*Rallonge pour aujourd'hui* quand l'enveloppe est épuisée, *Tout débloquer
+(PANIQUE)*, *Quitter*.
 
 ### Les profils
 
 Par défaut, une seule liste d'autorisations, et aucune barre de profils
 n'encombre la fenêtre. Si vous créez des profils dans les réglages, une
-barre de choix apparaît en haut. Modèles proposés : *Blackout*, *Essentiel*,
-*Travail*, *Visio*, chacun avec sa couleur et son budget indicatif. Un
-profil est une liste d'autorisations complète : basculer de *Travail* à
-*Visio* remplace l'une par l'autre.
+barre de choix apparaît en haut. Modèles proposés (*Depuis un modèle*) :
+*Blackout*, *Essentiel*, *Travail*, *Visio*, chacun avec sa couleur et son
+budget indicatif, et *Libre*, qui ne filtre rien mais laisse tourner le
+compteur. Un profil est une liste d'autorisations complète : basculer de
+*Travail* à *Visio* remplace l'une par l'autre.
 
 ### Effacer et recommencer
 
@@ -383,8 +461,8 @@ programme ne reste bloqué sans moyen de le débloquer.
 
 ### L'aide intégrée
 
-La touche **F1** ouvre une aide en français qui reprend tout ce qui précède,
-directement dans le programme.
+La touche **F1** (ou le bouton *Aide F1*) ouvre une aide en français qui
+reprend tout ce qui précède, directement dans le programme.
 
 ---
 
@@ -441,8 +519,11 @@ d'icône). L'avertissement de démarrage et l'autotest affichent le chemin du
 Python réellement utilisé, avec la commande d'installation exacte à taper.
 
 **Plus rien ne se connecte, même les programmes autorisés** — la case
-**DNS/DHCP essentiels** n'est pas cochée dans les réglages. Sans résolution
+**Autoriser DNS/DHCP** n'est pas cochée dans les réglages. Sans résolution
 de noms, aucun programme ne sait où aller.
+
+**Un VPN ne se connecte plus, protection active** — autorisez « Noyau de
+Windows » dans la liste : certains VPN envoient leur trafic depuis le noyau.
 
 **NetGate ne démarre pas** — lancez-le depuis un *Terminal (administrateur)*
 pour voir l'erreur, ou ouvrez `netgate.log` à côté de `netgate.py` (ou dans
@@ -464,7 +545,8 @@ pour dire laquelle fonctionne sur ce PC.
 NetGate n'a pas pu s'ouvrir ou a échoué ; la raison est dans les réglages
 (sous *Moteur de filtrage*) et dans `netgate.log`. Un autre NetGate tourne
 peut-être déjà. Pour vérifier le moteur sur ce PC, quittez NetGate et
-lancez l'autotest (`python netgate.py --test-wfp`, voir « Lancement »).
+lancez l'autotest (`python netgate.py --test-wfp`, voir
+[Lancement](#3-lancement)).
 
 **Un programme bloqué passe quand même** — avec le moteur NetGate, cela ne
 devrait pas arriver : vérifiez le bandeau. Avec le moteur de repli, le
