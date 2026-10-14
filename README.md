@@ -14,6 +14,8 @@
 
 </div>
 
+**Français** · [English](README.en.md)
+
 ---
 
 > [!NOTE]
@@ -43,11 +45,12 @@ Version actuelle : 2.2 — l'historique des livraisons est sur la page des
 [versions publiées](https://github.com/theptitprince/NetGate/releases), et
 résumé en tête de `netgate.py`.
 
-**Télécharger.** `NetGate.exe`, autonome (inutile d'installer Python), est
-joint à la [dernière version publiée](https://github.com/theptitprince/NetGate/releases/latest).
-Pour faire tourner le script lui-même : Python 3.8+ avec tkinter, `psutil`,
-`pywintrace`, `pystray` et `pillow` — Windows 10 ou 11, droits
-administrateur.
+**Télécharger.** Les sources sont sur la page des
+[versions publiées](https://github.com/theptitprince/NetGate/releases), ou
+par `git clone`. Pour faire tourner le script : Python 3.8+ avec tkinter,
+`psutil`, `pywintrace`, `pystray` et `pillow` — Windows 10 ou 11, droits
+administrateur. Un `NetGate.exe` autonome, qui se passe de Python, se
+construit avec PyInstaller (voir « Construire un exécutable »).
 
 ## Sommaire
 
@@ -137,7 +140,7 @@ git clone https://github.com/theptitprince/NetGate.git C:\NetGate
 | `netgate.py` | le programme complet, en un seul fichier |
 | `LICENSE` | le texte de la licence du programme (voir [Licence](#10-licence)) |
 | `README.md` | ce document |
-| `NetGate.exe` | l'exécutable autonome, joint aux [versions publiées](https://github.com/theptitprince/NetGate/releases) (il n'est pas dans le dépôt) |
+| `NetGate.exe` | l'exécutable autonome, à construire soi-même (voir « Construire un exécutable ») ; il n'est ni dans le dépôt ni joint aux versions publiées |
 
 Placez `netgate.py` (ou `NetGate.exe`) **dans son propre dossier** : il y
 crée ses fichiers de travail (voir
