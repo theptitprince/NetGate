@@ -4,7 +4,7 @@
 
 **The Internet tap is closed; you open it program by program.**
 
-![Version](https://img.shields.io/badge/version-2.2-2ea44f)
+![Version](https://img.shields.io/badge/version-2.3-2ea44f)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)
 ![tkinter](https://img.shields.io/badge/interface-tkinter-3776AB?logo=python&logoColor=white)
 ![WFP](https://img.shields.io/badge/filtering-Windows%20Filtering%20Platform-0078D6?logo=windows&logoColor=white)
@@ -42,7 +42,7 @@ exchanges with the Internet, and keeps a daily allowance with alerts at 50,
 over from one launch to the next, a counter per program and per day, and a
 shield in the notification area that fills up with your consumption.
 
-Current version: 2.2 — the release history is on the
+Current version: 2.3 — the release history is on the
 [releases](https://github.com/theptitprince/NetGate/releases) page, and
 summarized at the top of `netgate.py`.
 
@@ -140,7 +140,9 @@ git clone https://github.com/theptitprince/NetGate.git C:\NetGate
 |---|---|
 | `netgate.py` | the complete program, in a single file |
 | `LICENSE` | the text of the program's license (see [License](#10-license)) |
-| `README.md` | this document, in French (this English version is `README.en.md`) |
+| `NOTICE` | the additional license terms (section 7): the notice to keep |
+| `README.md` | the French version of this document |
+| `README.en.md` | its English translation (this file) |
 | `NetGate.exe` | the standalone executable, to build yourself (see “Building an executable”); it is neither in the repository nor attached to the releases |
 
 Place `netgate.py` (or `NetGate.exe`) **in its own folder**: it creates
@@ -441,8 +443,9 @@ opening or closing, so that you do not wonder why everything stopped at
 
 The shield fills up with consumption (green → orange → red). Right-click:
 *Ouvrir NetGate* (open NetGate), the choice of profile (if you have
-created any), today's consumption against the allowance with the active
-profile, *Rallonge pour aujourd'hui* when the allowance is used up,
+created any), *À propos...* (about: the legal notices, in the help),
+today's consumption against the allowance with the active profile,
+*Rallonge pour aujourd'hui* when the allowance is used up,
 *Tout débloquer (PANIQUE)* (unblock everything, panic), *Quitter*.
 
 ### Profiles
@@ -466,7 +469,13 @@ to unblock it.
 ### Built-in help
 
 The **F1** key, or the *Aide F1* (Help F1) button, opens a help screen in
-French that covers everything above, directly in the program.
+French that covers everything above, directly in the program. Its
+*À propos* (about) section, which the icon's menu also opens
+(*À propos...*), gives the legal notices: the notice “NetGate, par ETDEL”
+with the repository address, the copyright, the license, the absence of
+warranty and the additional terms (see [License](#10-license)). The status
+bar, at the bottom of the main window, always shows the version and this
+notice.
 
 ---
 
@@ -501,6 +510,12 @@ launch, SmartScreen may display a warning (unsigned program): *More info*
 
 An overzealous antivirus can block PyInstaller: it is the most common
 cause of failure.
+
+**Distributing the executable.** `NetGate.exe` does not embed `LICENSE` or
+`NOTICE`. Anyone who distributes it must ship these two files with it (in
+the same folder or the same archive) and give access to the corresponding
+source code, as the GPL requires. The legal notices themselves are built
+into the program (status bar, F1 help).
 
 ---
 
@@ -593,9 +608,26 @@ with its source code and the copyright notice. The program is provided
 **without any warranty**: it helps you keep your consumption under
 control; it replaces neither your vigilance nor your system's protections.
 
+### Additional terms (section 7)
+
+The GPL v3 lets the author add a few terms (section 7). NetGate's are in the
+[`NOTICE`](NOTICE) file, in French and in English:
+
+- **Attribution**: every copy or modified version must keep, visible to the user (an "About"
+  window or equivalent) and in its documentation, the notice:
+
+  > NetGate, par ETDEL — https://github.com/theptitprince/NetGate
+
+  A modified version may prefix it with "D'après" (or "Based on") and add its own credits,
+  but may neither remove nor hide it.
+- **Origin**: a modified version must state clearly that it has been modified, and must not
+  present itself as the original or as endorsed by ETDEL.
+
+In NetGate, this notice is shown in the status bar and in the built-in help (F1), *A propos* (about) section.
+
 The full text of the license is in the repository's `LICENSE` file and at
 <https://www.gnu.org/licenses/gpl-3.0.html>. The source file
-`netgate.py` carries the corresponding license header.
+`netgate.py` carries a header that points to `LICENSE` and `NOTICE`.
 
 ---
 

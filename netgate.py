@@ -15,6 +15,10 @@
 #
 # Vous devriez avoir recu une copie de la GNU General Public License avec ce
 # programme (fichier LICENSE). Sinon, voir <https://www.gnu.org/licenses/>.
+#
+# NetGate, par ETDEL -- https://github.com/theptitprince/NetGate
+# Licence GPL-3.0-or-later avec conditions additionnelles (article 7) :
+# voir le fichier NOTICE.
 """
 NetGate - Controle d'acces Internet par application (Windows)
 =============================================================
@@ -72,6 +76,13 @@ V2.1  Comptage par programme retabli : sur Windows 11, les evenements de
 V2.2  Un seul NetGate a la fois sur la machine : un second lancement affiche
       la fenetre de celui qui tourne deja (meme reduit pres de l'horloge),
       sans redemander les droits administrateur.
+V2.3  Licence GPL-3.0-or-later completee de conditions additionnelles
+      (article 7, fichier NOTICE) : toute copie ou version modifiee garde
+      la mention "NetGate, par ETDEL" et l'adresse du depot. La barre
+      d'etat l'affiche en permanence ; la section A propos de l'aide (F1),
+      que le menu de l'icone ouvre aussi (A propos...), donne les mentions
+      legales : licence, absence de garantie, conditions additionnelles.
+      L'en-tete de ce fichier source renvoie lui aussi a NOTICE.
 """
 
 import contextlib
@@ -139,14 +150,43 @@ ANNEE = "2026"
 # Numerotation : V<majeure>.<mineure>, plus une lettre pour une retouche
 # mineure (V1.1a). La majeure change en cas de refonte, la mineure a chaque
 # ajout ou correction, la lettre pour un ajustement cosmetique.
-VERSION = "2.2"
+VERSION = "2.3"
 
 VERSION_TXT = "V" + VERSION
 COPYRIGHT = "%s \u00a9 %s" % (AUTEUR, ANNEE)
 
+# Mention a garder, intacte et visible, dans toute copie ou version modifiee
+# (conditions additionnelles de l'article 7 de la GPL, fichier NOTICE). Elle
+# reste en francais ; NetGate l'affiche dans la barre d'etat et dans l'aide.
+# L'adresse n'est pas cliquable : NetGate tourne en administrateur, et le
+# navigateur ouvert depuis lui le serait aussi.
+DEPOT = "https://github.com/theptitprince/NetGate"
+MENTION = "NetGate, par ETDEL \u2014 " + DEPOT
+
 __author__ = AUTEUR
 __copyright__ = COPYRIGHT
 __version__ = VERSION
+
+
+def texte_a_propos():
+    """Mentions legales de NetGate, une ligne par element, la mention en
+    tete : section A propos de l'aide (F1)."""
+    return [
+        MENTION,
+        "Copyright \u00a9 %s %s" % (ANNEE, AUTEUR),
+        "Logiciel libre, sous licence GNU GPL version 3 ou ulterieure "
+        "(GPL-3.0-or-later), avec des conditions additionnelles (article 7, "
+        "fichier NOTICE).",
+        "Fourni SANS AUCUNE GARANTIE, dans la mesure permise par la loi.",
+        "Texte de la licence : fichier LICENSE, ou "
+        "https://www.gnu.org/licenses/gpl-3.0.html",
+        "Conditions additionnelles : fichier NOTICE, ou "
+        + DEPOT + "/blob/main/NOTICE",
+        "Toute copie ou version modifiee doit garder la mention ci-dessus, "
+        "visible. Une version modifiee doit le dire et ne pas se presenter "
+        "comme l'original, ni comme approuvee par ETDEL.",
+    ]
+
 
 RULE_PREFIX = "NETGATE_"
 CREATE_NO_WINDOW = 0x08000000
@@ -2927,6 +2967,7 @@ class Tray:
                     checked=(lambda p: (lambda item: sm.data["active_profile"] == p))(pid),
                     radio=True))
             items.append(pystray.MenuItem("Profil", pystray.Menu(*subs)))
+        items.append(pystray.MenuItem("A propos...", self._a_propos))
         items.append(pystray.Menu.SEPARATOR)
         items.append(pystray.MenuItem(self._usage_text, None, enabled=False))
         items.append(pystray.MenuItem("Rallonge pour aujourd'hui...", self._rallonge,
@@ -2948,6 +2989,9 @@ class Tray:
 
     def _open(self, icon=None, item=None):
         self.app.after(0, self.app.show_window)
+
+    def _a_propos(self, icon=None, item=None):
+        self.app.after(0, self.app.show_about)
 
     def _rallonge(self, icon=None, item=None):
         self.app.after(0, self.app.rallonge)
@@ -3123,7 +3167,8 @@ HELP = [
     ("p", "La croix ferme la fenetre mais NetGate continue de surveiller ; le blocage "
           "reste actif. Pour tout arreter, utilise Quitter dans le menu de l'icone : "
           "les regles sont alors supprimees automatiquement. Clic droit sur l'icone "
-          "pour rouvrir, voir les Mo restants, tout debloquer ou quitter. "
+          "pour rouvrir, lire les mentions legales (A propos), voir les Mo "
+          "restants, tout debloquer ou quitter. "
           "Relancer NetGate alors qu'il tourne deja n'en ouvre pas un second : sa "
           "fenetre reapparait. "
           "Le blason se remplit avec ta consommation : vert, puis orange, puis rouge."),
@@ -3489,15 +3534,18 @@ class NetGateApp(tk.Tk):
     def _build_status(self):
         sb = tk.Frame(self, bg=C_PANEL2, height=26)
         sb.pack(fill="x", side="bottom")
-        self.lbl_status = tk.Label(sb, text="Pret", bg=C_PANEL2, fg=C_TXT_DIM,
-                                   font=("Segoe UI", 9), anchor="w", padx=14)
-        self.lbl_status.pack(side="left", fill="x", expand=True)
-        tk.Label(sb, text="%s %s    %s" % (APP_NAME, VERSION_TXT, COPYRIGHT),
+        # La mention (article 7, fichier NOTICE) doit rester visible : elle
+        # est posee la premiere, a droite, et c'est le message d'etat, a
+        # gauche, qui se raccourcit si la place manque.
+        tk.Label(sb, text="%s %s    %s" % (APP_NAME, VERSION_TXT, MENTION),
                  bg=C_PANEL2, fg=C_TXT_DIM,
                  font=("Segoe UI", 8), anchor="e", padx=14).pack(side="right")
         self.lbl_pending = tk.Label(sb, text="", bg=C_PANEL2, fg=C_WARN,
                                     font=("Segoe UI", 9), anchor="e", padx=14)
         self.lbl_pending.pack(side="right")
+        self.lbl_status = tk.Label(sb, text="Pret", bg=C_PANEL2, fg=C_TXT_DIM,
+                                   font=("Segoe UI", 9), anchor="w", padx=14)
+        self.lbl_status.pack(side="left", fill="x", expand=True)
 
     def status(self, msg):
         self.lbl_status.configure(text=msg)
@@ -4012,11 +4060,19 @@ class NetGateApp(tk.Tk):
             pass
         self.status("Compteur remis a zero (%s efface)" % fmt_bytes(ancien))
 
-    def show_help(self, event=None):
+    def show_about(self):
+        """Menu de l'icone, A propos... : l'aide, ouverte sur ses mentions
+        legales."""
+        self.show_window()
+        self.show_help(section="a_propos")
+
+    def show_help(self, event=None, section=None):
         if getattr(self, "help_win", None) is not None:
             try:
                 self.help_win.lift()
                 self.help_win.focus_force()
+                if section:
+                    self.help_win.aller_a(section)
                 return
             except Exception:
                 self.help_win = None
@@ -4042,7 +4098,7 @@ class NetGateApp(tk.Tk):
         tk.Label(tete, text="Aide de %s %s" % (APP_NAME, VERSION_TXT),
                  bg=C_PANEL, fg=C_TXT,
                  font=("Segoe UI Semibold", 15)).pack(anchor="w")
-        tk.Label(tete, text=COPYRIGHT, bg=C_PANEL, fg=C_TXT_DIM,
+        tk.Label(tete, text=MENTION, bg=C_PANEL, fg=C_TXT_DIM,
                  font=("Segoe UI", 9)).pack(anchor="w")
         tk.Label(head, text="Echap ou F1 pour fermer", bg=C_PANEL, fg=C_TXT_DIM,
                  font=("Segoe UI", 9)).pack(side="right", padx=22)
@@ -4068,9 +4124,14 @@ class NetGateApp(tk.Tk):
                           lmargin1=12, lmargin2=12)
 
         for tag, body in HELP:
+            if tag == "h1" and body == "A propos":
+                txt.mark_set("a_propos", "end-1c")
+                txt.mark_gravity("a_propos", "left")
             if tag == "about":
+                lignes = texte_a_propos()
                 txt.insert("end", "%s %s\n" % (APP_NAME, VERSION_TXT), "p")
-                txt.insert("end", COPYRIGHT + "\n", "code")
+                txt.insert("end", lignes[0] + "\n", "code")
+                txt.insert("end", "\n".join(lignes[1:]) + "\n", "p")
                 continue
             if tag == "code" and body == "@DOSSIER@":
                 txt.insert("end", STATE_DIR + "\n", "code")
@@ -4078,6 +4139,16 @@ class NetGateApp(tk.Tk):
             txt.insert("end", body + "\n", tag)
         txt.configure(state="disabled")
         txt.bind("<F1>", close)
+
+        def aller_a(mark):
+            try:
+                txt.yview(mark)
+            except Exception:
+                pass
+
+        w.aller_a = aller_a
+        if section:
+            aller_a(section)
 
     def open_folder(self):
         try:

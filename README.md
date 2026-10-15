@@ -4,7 +4,7 @@
 
 **Le robinet Internet est fermé ; vous l'ouvrez programme par programme.**
 
-![Version](https://img.shields.io/badge/version-2.2-2ea44f)
+![Version](https://img.shields.io/badge/version-2.3-2ea44f)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)
 ![tkinter](https://img.shields.io/badge/interface-tkinter-3776AB?logo=python&logoColor=white)
 ![WFP](https://img.shields.io/badge/filtrage-Windows%20Filtering%20Platform-0078D6?logo=windows&logoColor=white)
@@ -41,7 +41,7 @@ Il produit une liste d'autorisations qui vous survit d'un lancement à
 l'autre, un compteur par programme et par jour, et un blason dans la zone
 de notification qui se remplit avec votre consommation.
 
-Version actuelle : 2.2 — l'historique des livraisons est sur la page des
+Version actuelle : 2.3 — l'historique des livraisons est sur la page des
 [versions publiées](https://github.com/theptitprince/NetGate/releases), et
 résumé en tête de `netgate.py`.
 
@@ -139,7 +139,9 @@ git clone https://github.com/theptitprince/NetGate.git C:\NetGate
 |---|---|
 | `netgate.py` | le programme complet, en un seul fichier |
 | `LICENSE` | le texte de la licence du programme (voir [Licence](#10-licence)) |
-| `README.md` | ce document |
+| `NOTICE` | les conditions additionnelles de la licence (article 7) : la mention à conserver |
+| `README.md` | ce document, en français |
+| `README.en.md` | sa traduction en anglais |
 | `NetGate.exe` | l'exécutable autonome, à construire soi-même (voir « Construire un exécutable ») ; il n'est ni dans le dépôt ni joint aux versions publiées |
 
 Placez `netgate.py` (ou `NetGate.exe`) **dans son propre dossier** : il y
@@ -440,8 +442,9 @@ tout s'est arrêté à 22 h.
 ### L'icône près de l'horloge
 
 Le blason se remplit avec la consommation (vert → orange → rouge). Clic
-droit : *Ouvrir NetGate*, choix du profil (si vous en avez créé), la
-consommation du jour rapportée à l'enveloppe avec le profil actif,
+droit : *Ouvrir NetGate*, choix du profil (si vous en avez créé),
+*À propos...* (les mentions légales, dans l'aide), la consommation du jour
+rapportée à l'enveloppe avec le profil actif,
 *Rallonge pour aujourd'hui* quand l'enveloppe est épuisée, *Tout débloquer
 (PANIQUE)*, *Quitter*.
 
@@ -465,7 +468,12 @@ programme ne reste bloqué sans moyen de le débloquer.
 ### L'aide intégrée
 
 La touche **F1** (ou le bouton *Aide F1*) ouvre une aide en français qui
-reprend tout ce qui précède, directement dans le programme.
+reprend tout ce qui précède, directement dans le programme. Sa section
+*À propos*, que le menu de l'icône ouvre aussi (*À propos...*), donne les
+mentions légales : la mention « NetGate, par ETDEL » avec l'adresse du
+dépôt, le copyright, la licence, l'absence de garantie et les conditions
+additionnelles (voir [Licence](#10-licence)). La barre d'état, en bas de la
+fenêtre principale, affiche en permanence la version et cette mention.
 
 ---
 
@@ -501,6 +509,12 @@ même*.
 
 Un antivirus trop zélé peut bloquer PyInstaller : c'est la cause la plus
 fréquente d'échec.
+
+**Distribuer l'exécutable.** `NetGate.exe` n'embarque ni `LICENSE` ni
+`NOTICE`. Qui le distribue doit fournir ces deux fichiers avec lui (dans le
+même dossier ou la même archive) et donner accès aux sources
+correspondantes, comme le demande la GPL. Les mentions légales, elles, sont
+dans le programme (barre d'état, aide F1).
 
 ---
 
@@ -591,9 +605,26 @@ avec son code source et la mention de copyright. Le programme est fourni
 **sans aucune garantie** : il vous aide à maîtriser votre consommation, il
 ne remplace ni votre vigilance ni les protections de votre système.
 
+### Conditions additionnelles (article 7)
+
+La GPL v3 permet à l'auteur d'ajouter quelques conditions (article 7). Celles de NetGate sont dans
+le fichier [`NOTICE`](NOTICE), en français et en anglais :
+
+- **Attribution** : toute copie ou version modifiée doit garder, visible pour l'utilisateur
+  (fenêtre « À propos » ou équivalent) et dans sa documentation, la mention :
+
+  > NetGate, par ETDEL — https://github.com/theptitprince/NetGate
+
+  Une version modifiée peut la faire précéder de « D'après » et ajouter ses propres crédits,
+  sans la retirer ni la masquer.
+- **Origine** : une version modifiée doit dire clairement qu'elle est modifiée, et ne doit se
+  présenter ni comme l'original, ni comme approuvée par ETDEL.
+
+Dans NetGate, cette mention s'affiche dans la barre d'état et dans l'aide intégrée (F1), section « A propos ».
+
 Le texte intégral de la licence est dans le fichier `LICENSE` du dépôt et
 sur <https://www.gnu.org/licenses/gpl-3.0.html>. Le fichier source
-`netgate.py` porte l'en-tête de licence correspondant.
+`netgate.py` porte un en-tête qui renvoie à `LICENSE` et `NOTICE`.
 
 ---
 
